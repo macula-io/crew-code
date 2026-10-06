@@ -1,8 +1,27 @@
 # crew-code
 
-Run a coding crew of Claude Code sessions, each in its own kitty tab, and see all of them on one dashboard.
+[![CI](https://img.shields.io/github/actions/workflow/status/macula-io/crew-code/ci.yml?branch=main&label=CI)](https://github.com/macula-io/crew-code/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
+[![Claude Code](https://img.shields.io/badge/Claude%20Code-plugin-D97757?logo=claude&logoColor=white)](https://docs.claude.com/en/docs/claude-code)
+[![kitty](https://img.shields.io/badge/terminal-kitty-555?logo=gnometerminal&logoColor=white)](https://sw.kovidgoyal.net/kitty/)
+[![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-support-ea4aaa.svg?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/rgfaber)
 
-`crew` is a Claude Code plugin plus a small launcher. Every session that loads the plugin checks in to a shared dashboard (state, context used, cost, the card it holds, a progress bar). Members take their work from a kanban board, hand over to a fresh session before their context runs out, and never push without the owner's yes.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/crew-code-full-dark.svg">
+    <img src="assets/crew-code-full-light.svg" alt="Macula crew code" width="320">
+  </picture>
+</p>
+
+<p align="center">
+  <strong>Run a coding crew of Claude Code sessions from one dashboard</strong>
+</p>
+
+---
+
+## What is crew-code?
+
+A Claude Code plugin plus a small launcher. Each member of the crew is a Claude Code session in its own kitty tab. Every session that loads the plugin checks in to a shared dashboard: its state, context used, cost, the card it holds and a progress bar. Members take their work from a kanban board, hand over to a fresh session before their context runs out, and never push without the owner's yes.
 
 ## Install
 
