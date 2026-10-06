@@ -1,0 +1,13 @@
+{
+  "name": "crew-code",
+  "owner": {
+    "name": "macula.io"
+  },
+  "plugins": [
+    {
+      "name": "crew",
+      "source": "./"
+    }
+  ],
+  "description": "crew: run a coding crew of Claude Code sessions from one dashboard"
+}

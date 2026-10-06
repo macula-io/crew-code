@@ -1,0 +1,29 @@
+{
+  "name": "crew",
+  "version": "0.2.0",
+  "description": "A coding crew of Claude Code sessions: live dashboard, progress bars, a kanban board loop, context limits and handovers",
+  "author": { "name": "macula.io", "url": "https://github.com/macula-io/crew-code" },
+  "homepage": "https://github.com/macula-io/crew-code",
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "supervisor": {
+      "type": "string",
+      "title": "Supervisor",
+      "description": "The session that coordinates the crew. It is never woken on idle, and members report to it.",
+      "default": "Supervisor"
+    },
+    "members": {
+      "type": "string",
+      "title": "Members",
+      "description": "Crew member names, comma-separated, in dashboard order (for example: Ada, Grace, Linus). Leave empty to accept any name.",
+      "default": ""
+    },
+    "owner": {
+      "type": "string",
+      "title": "Owner",
+      "description": "The person who watches the dashboard and whose yes every push needs, as the prompts name them.",
+      "default": "the owner"
+    }
+  }
+}

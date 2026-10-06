@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+# crew: bring crew members up on their own mesh key.
+#
+#   crew up [--fresh]          every member on the roster that is not running, one kitty tab each
+#   crew <Name> [--fresh] [--tab]
+#                              one member in THIS terminal (resumes its last session unless
+#                              --fresh); --tab opens it in a new kitty tab instead
+#   crew rename <Old> <New>    move key, role card and offline beats to a new name
+#   crew ls                    roster, liveness and the session a resume would open
+#
+# Each session runs claude with CREW_NAME=<Name>, MACULA_MCP_AGENT=<name> and -n <Name>.
+# Every session runs on claude-opus-5-5 unless CREW_MODEL says otherwise.
+# Set CREW_DRY_RUN=1 to print the launch instead of running it.
+set -euo pipefail
+
+SESSIONS="${HOME}/.claude/sessions"
+BEATS="${HOME}/.claude/crew"
+PROJECTS="${HOME}/.claude/projects"
+KEYS="${HOME}/.config/macula-mcp/keys"
+# Where member sessions start. Override with CREW_WORKDIR.
+WORKDIR="${CREW_WORKDIR:-${HOME}}"
+# The session that coordinates the crew: it has a handover, not a role card.
+SUPERVISOR="${CREW_SUPERVISOR:-Supervisor}"
+LIVE_WINDOW_S=600
+# Every crew session runs on this model, fresh or resumed. Override with CREW_MODEL.
+MODEL="${CREW_MODEL:-claude-opus-5-5}"
+
+die() { echo "crew: $*" >&2; exit 1; }
+
+# The roster: every ROLE card, plus the supervisor.
+roster() {
+    {
+        echo "${SUPERVISOR}"
+        for card in "${SESSIONS}"/ROLE_*.md; do
+            [[ -e "${card}" ]] || continue
+            card="${card##*/ROLE_}"
+            echo "${card%.md}"
+        done
+    } | awk '!seen[$0]++'
+}
+
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$ ]]; }
+
+lower() { tr '[:upper:]' '[:lower:]' <<<"$1"; }
+
+# Newest beat for a name: "<sessionId> <state> <beatAt seconds>", or nothing.
+last_beat() {
+    local name="$1"
+    [[ -d "${BEATS}" ]] || return 0
+    find "${BEATS}" -maxdepth 1 -name '*.json' -print0 \
+        | xargs -0 -r jq -r --arg n "${name}" \
+            'select(.name == $n) | "\(.beatAt // 0) \(.sessionId) \(.state)"' 2>/dev/null \
+        | sort -n | tail -1 | awk '{ printf "%s %s %d\n", $2, $3, $1 / 1000 }'
+}
+
+boot_time() { awk '/^btime /{ print $2 }' /proc/stat; }
+
+# Live = a recent, non-offline beat written since this boot. A beat from before a
+# reboot is stale whatever its age: no process survived to write it.
+is_live() {
+    local beat state at
+    beat="$(last_beat "$1")"
+    [[ -n "${beat}" ]] || return 1
+    read -r _ state at <<<"${beat}"
+    [[ "${state}" != offline ]] && ((at >= $(boot_time))) && (($(date +%s) - at < LIVE_WINDOW_S))
+}
+
+transcript_of() {
+    find "${PROJECTS}" -maxdepth 2 -name "$1.jsonl" -print -quit 2>/dev/null
+}
+
+# The directory a session was started in: claude --resume finds it only from there.
+cwd_of() {
+    grep -m1 -o '"cwd":"[^"]*"' "$1" | sed 's/^"cwd":"//; s/"$//'
+}
+
+latest_handover() {
+    find "${SESSIONS}" -maxdepth 1 -name "HANDOVER_*_$1.md" -print 2>/dev/null | sort | tail -1
+}
+
+# The board loop itself is in every session's instructions (the crew mod's board rules), so
+# the launcher only says to work the board. One copy of the rules, in the mod.
+BOARD_LINE="Then work the board, as the crew board rules in your instructions describe."
+
+fresh_prompt() {
+    local name="$1" card="${SESSIONS}/ROLE_$1.md" handover
+    handover="$(latest_handover "${name}")"
+    local text="You are ${name}. The crew launcher started this session fresh."
+    [[ -e "${card}" ]] && text+=" Read your role card ${card}."
+    [[ -n "${handover}" ]] && text+=" Read your latest handover ${handover}."
+    text+=" ${BOARD_LINE}"
+    echo "${text}"
+}
+
+# A resumed session already has its context; it only needs telling to work the board.
+resume_prompt() {
+    echo "You are $1. The crew launcher resumed this session. Read any messages that came in for you. ${BOARD_LINE}"
+}
+
+# launch <tab|here> <Name> <cwd> <claude args...>: a new kitty tab, or exec in this terminal.
+launch() {
+    local where="$1" name="$2" cwd="$3"
+    shift 3
+    local agent
+    agent="$(lower "${name}")"
+    # kitty @ launch runs the command in kitty's own environment, without what the
+    # user's rc files export (GH_TOKEN and other secrets). A hand-opened tab runs an
+    # interactive, non-login ${SHELL}; go through the same, then exec claude.
+    # That shell also exports ANTHROPIC_API_KEY, which would bill every session to
+    # the API key instead of the claude.ai login, so it is dropped here.
+    local cmd=("${SHELL:-/usr/bin/zsh}" -ic 'exec "$@"' crew
+        env -u MACULA_MCP_IDENTITY -u ANTHROPIC_API_KEY "CREW_NAME=${name}" "MACULA_MCP_AGENT=${agent}" claude --model "${MODEL}" -n "${name}" "$@")
+    if [[ -n "${CREW_DRY_RUN:-}" ]]; then
+        printf '[%s] cd %q &&' "${where}" "${cwd}"
+        printf ' %q' "${cmd[@]}"
+        printf '\n'
+        return 0
+    fi
+    if [[ "${where}" == here ]]; then
+        cd "${cwd}"
+        exec "${cmd[@]}"
+    fi
+    # claude sets the terminal title over OSC, which kitty shows as the tab title
+    # unless the tab has its own: pin both by the window id launch prints.
+    local wid
+    wid="$(kitty @ launch --type=tab --cwd="${cwd}" --title="${name}" --tab-title="${name}" -- "${cmd[@]}")"
+    kitty @ set-window-title --match "id:${wid}" "${name}"
+    kitty @ set-tab-title --match "window_id:${wid}" "${name}"
+}
+
+kitty_has_tab() {
+    [[ -n "${CREW_DRY_RUN:-}" ]] && return 1
+    kitty @ ls 2>/dev/null | jq -e --arg t "$1" '[.[].tabs[] | select(.title == $t)] | length > 0' >/dev/null
+}
+
+check_kitty() {
+    [[ -n "${CREW_DRY_RUN:-}" ]] && return 0
+    command -v kitty >/dev/null || die "kitty is not on PATH"
+    kitty @ ls >/dev/null 2>&1 || die "kitty remote control is not reachable: run crew from a kitty window (allow_remote_control yes)"
+}
+
+bring_up() {
+    local name="$1" mode="$2" where="$3" beat sid transcript cwd
+    valid_name "${name}" || die "'${name}' is not a plain name (letters, digits, _ and -)"
+    if is_live "${name}" || kitty_has_tab "${name}"; then
+        echo "${name}: already running, left alone"
+        return 0
+    fi
+    adopt_key "${name}"
+    if [[ "${mode}" == resume ]]; then
+        beat="$(last_beat "${name}")"
+        sid="${beat%% *}"
+        transcript="$([[ -n "${sid}" ]] && transcript_of "${sid}" || true)"
+        if [[ -n "${transcript}" ]]; then
+            cwd="$(cwd_of "${transcript}")"
+            [[ -d "${cwd}" ]] || cwd="${WORKDIR}"
+            echo "${name}: resuming ${sid} in ${cwd}"
+            launch "${where}" "${name}" "${cwd}" --resume "${sid}" "$(resume_prompt "${name}")"
+            return 0
+        fi
+        echo "${name}: no earlier session found, starting fresh"
+    fi
+    echo "${name}: fresh session in ${WORKDIR}"
+    launch "${where}" "${name}" "${WORKDIR}" "$(fresh_prompt "${name}")"
+}
+
+list() {
+    local name beat sid state at
+    printf '%-11s %-8s %-36s %s\n' NAME STATE "LAST SESSION" KEY
+    while read -r name; do
+        beat="$(last_beat "${name}")"
+        sid=- state=never
+        [[ -n "${beat}" ]] && read -r sid state at <<<"${beat}"
+        is_live "${name}" && state=live
+        [[ "${state}" == live ]] || [[ "${state}" == never ]] || state=offline
+        local key
+        key="$(key_of "${name}")"
+        printf '%-11s %-8s %-36s %s\n' "${name}" "${state}" "${sid}" "${key:--}"
+    done < <(roster)
+}
+
+# The key file a member's node id lives in: agent-<name>.key, or, for a member
+# started before MACULA_MCP_AGENT, the per-session key its mesh server used
+# (named after the session it STARTED in; a /clear keeps the server and the key).
+key_of() {
+    local lname sid
+    lname="$(lower "$1")"
+    [[ -e "${KEYS}/agent-${lname}.key" ]] && { echo "agent-${lname}.key"; return 0; }
+    find "${BEATS}" -maxdepth 1 -name '*.json' -print0 2>/dev/null \
+        | xargs -0 -r jq -r --arg n "$1" 'select(.name == $n) | "\(.beatAt // 0) \(.sessionId)"' 2>/dev/null \
+        | sort -rn | while read -r _ sid; do
+            [[ -e "${KEYS}/${sid}.key" ]] && { echo "${sid}.key"; break; }
+        done
+    return 0
+}
+
+# A member that ran before MACULA_MCP_AGENT keeps its node id: its last
+# per-session key becomes agent-<name>.key before the first agent start.
+adopt_key() {
+    local key lname
+    lname="$(lower "$1")"
+    key="$(key_of "$1")"
+    [[ -n "${key}" && "${key}" != "agent-${lname}.key" ]] || return 0
+    if [[ -n "${CREW_DRY_RUN:-}" ]]; then
+        echo "$1: would adopt ${key} as agent-${lname}.key"
+        return 0
+    fi
+    mv -n "${KEYS}/${key}" "${KEYS}/agent-${lname}.key"
+    echo "$1: adopted ${key} as agent-${lname}.key (node id kept)"
+}
+
+name_in_use() {
+    local name="$1" lname
+    lname="$(lower "${name}")"
+    roster | tr '[:upper:]' '[:lower:]' | grep -qx "${lname}" && return 0
+    [[ -e "${KEYS}/agent-${lname}.key" ]] && return 0
+    [[ -n "$(last_beat "${name}")" ]] && return 0
+    return 1
+}
+
+rename() {
+    local old="$1" new="$2" lold lnew
+    valid_name "${new}" || die "'${new}' is not a plain name (letters, digits, _ and -)"
+    lold="$(lower "${old}")"
+    lnew="$(lower "${new}")"
+    [[ "${lold}" != "${lnew}" ]] || die "'${old}' and '${new}' are the same name"
+    roster | grep -qx "${old}" || [[ -n "$(key_of "${old}")" ]] \
+        || die "no crew member '${old}' (no role card, no key)"
+    name_in_use "${new}" && die "'${new}' is already in use (role card, key or session); pick another name"
+    is_live "${old}" && die "${old} is running; stop that session first, its mesh server holds the key"
+
+    local key
+    key="$(key_of "${old}")"
+    if [[ -n "${key}" ]]; then
+        mv -n "${KEYS}/${key}" "${KEYS}/agent-${lnew}.key"
+        echo "key:       ${key} -> agent-${lnew}.key (same node id)"
+    else
+        echo "key:       none found for ${old}; ${new} gets a new one on its first start"
+    fi
+    if [[ -e "${SESSIONS}/ROLE_${old}.md" ]]; then
+        mv -n "${SESSIONS}/ROLE_${old}.md" "${SESSIONS}/ROLE_${new}.md"
+        sed -i -E "s/\\b${old}\\b/${new}/g; s/crew:${lold}\\b/crew:${lnew}/g" "${SESSIONS}/ROLE_${new}.md"
+        echo "role card: ROLE_${old}.md -> ROLE_${new}.md (name replaced inside)"
+    fi
+    local moved=0 beat tmp
+    while IFS= read -r -d '' beat; do
+        [[ "$(jq -r '.name' "${beat}")" == "${old}" ]] || continue
+        tmp="$(mktemp "${beat}.XXXX")"
+        jq --arg n "${new}" '.name = $n' "${beat}" >"${tmp}" && mv "${tmp}" "${beat}"
+        moved=$((moved + 1))
+    done < <(find "${BEATS}" -maxdepth 1 -name '*.json' -print0 2>/dev/null)
+    echo "sessions:  ${moved} dashboard beat(s) now name ${new}, so 'crew ${new}' resumes them"
+    local store
+    for store in "${HOME}"/.claude/plugins/store/crew_*.json; do
+        [[ -e "${store}" ]] || continue
+        tmp="$(mktemp "${store}.XXXX")"
+        jq --arg o "${old}" --arg n "${new}" '
+            with_entries(
+                if .key == "refresh:\($o)" then .key = "refresh:\($n)"
+                elif .key == "refreshed:\($o)" then .key = "refreshed:\($n)"
+                elif (.key | startswith("name:")) and .value == $o then .value = $n
+                else . end)' "${store}" >"${tmp}" && mv "${tmp}" "${store}"
+        echo "dashboard: refresh mode and session names in ${store##*/} moved to ${new}"
+    done
+
+    echo
+    echo "Follow-ups (not done here):"
+    echo "- GitHub: rename label crew:${lold} -> crew:${lnew} in every repo that has it; open issues using it:"
+    gh search issues --label "crew:${lold}" --state open --json repository,number \
+        --jq '.[] | "    \(.repository.nameWithOwner)#\(.number)"' 2>/dev/null || echo "    (gh search failed)"
+    echo "- mcl-kanban roster: discharge agent ${lold}, enlist ${lnew}"
+    echo "- crew mod: PLANETS in ~/.claude/mods/crew/hooks/register.tsx names ${old}"
+    echo "- handovers and session notes naming ${old} (history, left as written):"
+    grep -l -w "${old}" "${SESSIONS}"/HANDOVER_*.md 2>/dev/null | sed 's/^/    /' | tail -10 || true
+    echo "- memory files naming ${old}:"
+    grep -rl -w "${old}" "${HOME}/.claude/projects/-home-rl-work-github-com/memory" 2>/dev/null | sed 's/^/    /' || true
+}
+
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+main() {
+    [[ $# -ge 1 ]] || usage 1
+    local mode=resume
+    case "$1" in
+        -h | --help | help) usage 0 ;;
+        ls) list ;;
+        rename)
+            [[ $# -eq 3 ]] || die "usage: crew rename <Old> <New>"
+            rename "$2" "$3"
+            ;;
+        up)
+            [[ "${2:-}" == --fresh ]] && mode=fresh
+            check_kitty
+            while read -r name; do bring_up "${name}" "${mode}" tab; done < <(roster)
+            ;;
+        -*) die "unknown option '$1'" ;;
+        *)
+            local name="$1" where=here opt
+            shift
+            for opt in "$@"; do
+                case "${opt}" in
+                    --fresh) mode=fresh ;;
+                    --tab) where=tab ;;
+                    *) die "unknown option '${opt}' (crew <Name> [--fresh] [--tab])" ;;
+                esac
+            done
+            [[ "${where}" == tab ]] && check_kitty
+            bring_up "${name}" "${mode}" "${where}"
+            ;;
+    esac
+}
+
+main "$@"

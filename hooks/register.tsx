@@ -1,0 +1,896 @@
+import { atom, read, update } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
+
+import type { CrewBeat, CrewGoal, CrewGoalView, CrewPending, CrewProgress, CrewRefreshFlow, CrewState, CrewTask } from '../types'
+
+const PANE = 'crew'
+const BEAT_MS = 20_000
+const REFRESH_MS = 5_000
+const OFFLINE_AFTER_MS = 90_000
+// How long a dead session's last beat keeps its row. About visibility, not liveness: a
+// live session rewrites its file every BEAT_MS whether or not a turn runs, so a file
+// swept by mistake is back within one beat. Long enough to notice a member went down.
+const SWEEP_AFTER_MS = 60 * 60_000
+const BAR_CELLS = 14
+// The crew, from the plugin's settings (userConfig): who supervises, who the members are, and who
+// owns the work (the person whose yes a push needs). Set once per load by register().
+let SUPERVISOR = 'Supervisor'
+let OWNER = 'the owner'
+let ROSTER: string[] = [SUPERVISOR]
+const namesOf = (text: string) => text.split(',').map(name => name.trim()).filter(Boolean)
+
+const beats = atom({ plugin: 'crew', key: 'beats' } as const, [])
+const me = atom({ plugin: 'crew', key: 'me' } as const, null)
+const reported = atom({ plugin: 'crew', key: 'reported' } as const, null)
+const tasks = atom({ plugin: 'crew', key: 'tasks' } as const, {})
+const IDLE_FLOW: CrewRefreshFlow = { phase: 'none', requestedAt: 0, name: '', path: '', isForced: false, isLimit: false }
+const refreshFlow = atom({ plugin: 'crew', key: 'refresh' } as const, IDLE_FLOW)
+
+const DEFAULT_THRESHOLD = 40
+// Package mode: cards are small and the cards of one work package share code and decisions, so a
+// member keeps its context across them and refreshes when the board hands it a card from another
+// package. Below PACKAGE_MIN_PERCENT the context is too small to be worth a handover.
+const PACKAGE_MIN_PERCENT = 20
+const PACKAGE_HANDOVER_NOTE =
+  'Crew package mode: this card is from another work package than your last one, so do not start this card. ' +
+  'End your turn now: this session hands over and a fresh one finds the card with get_my_cards.'
+const AUTO_TASK_PERCENT = 20
+const AUTO_IDLE_PERCENT = 15
+const AUTO_IDLE_MS = 50 * 60_000
+const IDLE_CHECK_MS = 60_000
+// A card can use 30 to 40% of context and its size is not known when it is claimed, so no card
+// starts at or above the claim limit, and a member hands over at a safe point at the handover
+// limit. Both fixed; card-usage.tsv is what tunes them.
+const CLAIM_LIMIT = 50
+const HANDOVER_LIMIT = 70
+// Wake-on-idle: an idle member with nothing in hand is prompted after a pause that doubles with
+// every wake that brings it no card, up to WAKE_MAX_MS. A board_empty answer holds wakes off longer.
+const WAKE_AFTER_MS = 2 * 60_000
+const WAKE_MAX_MS = 30 * 60_000
+const BOARD_EMPTY_MS = 30 * 60_000
+const MESH_CALL = 'mcp__macula__mesh_call'
+const CLAIMS = ['mcl-kanban/claim_next_card', 'mcl-kanban/claim_card']
+const wakes = atom({ plugin: 'crew', key: 'wakes' } as const, 0)
+const wokenAt = atom({ plugin: 'crew', key: 'wokenAt' } as const, 0)
+const boardEmptyAt = atom({ plugin: 'crew', key: 'boardEmptyAt' } as const, 0)
+const cardStart = atom({ plugin: 'crew', key: 'cardStart' } as const, null)
+const activeAt = atom({ plugin: 'crew', key: 'activeAt' } as const, 0)
+// The crew's one goal lives on the board (kanban#18); the mod reads it over the mesh, through the
+// macula MCP server's mesh_call, and never from the board's own storage.
+const MESH_SERVER = 'macula'
+const GOAL_MS = 5 * 60_000
+const NO_GOAL: CrewGoalView = { goal: null, error: '' }
+const goalView = atom({ plugin: 'crew', key: 'goal' } as const, NO_GOAL)
+const PACKAGE_REF = /^[\w.-]+\/[\w.-]+#\d+$/
+const GOAL_USAGE =
+  'Usage: /crew-goal shows the crew goal. /crew-goal <one or two work-package refs> <one sentence> sets it, ' +
+  'e.g. /crew-goal macula-io/macula#75 A stranger can find an app on the mesh'
+
+const textOf = (blocks: { type: string; text?: string }[]) => blocks.map(block => block.text ?? '').join('\n').trim()
+
+// One board procedure over the mesh: its result, or why it failed in the board's or the mesh's words.
+const askBoard = async ($: EngineInterface, procedure: string, args: Record<string, unknown>) => {
+  const answer = await $.mcp.call(MESH_SERVER, 'mesh_call', { procedure, args }).catch((error: unknown) => ({
+    content: [{ type: 'text', text: String(error) }],
+    isError: true,
+  }))
+  const text = textOf(answer.content)
+  if (answer.isError) return { error: text || `${procedure} failed` }
+  const reply = JSON.parse(text) as { result?: Record<string, unknown> }
+  const failed = reply.result?.error
+  return failed === undefined ? { result: reply.result ?? {} } : { error: `${procedure}: ${JSON.stringify(failed)}` }
+}
+
+const goalOf = (result: Record<string, unknown>): CrewGoal | null => {
+  const held = result.goal as Partial<CrewGoal> | undefined
+  if (!held?.goal) return null
+  return { goal: String(held.goal), packages: (held.packages ?? []).map(String), by: String(held.by ?? ''), at: Number(held.at) || 0 }
+}
+
+// A failed read keeps the goal last seen and says why, so a mesh hiccup never blanks the goal.
+const loadGoal = async ($: EngineInterface) => {
+  const asked = await askBoard($, 'mcl-kanban/get_goal', {})
+  return update($, goalView, seen => ('error' in asked ? { goal: seen.goal, error: asked.error } : { goal: goalOf(asked.result), error: '' }))
+}
+
+const dayOf = (at: number) => new Date(at).toISOString().slice(0, 10)
+
+const describeGoal = (view: CrewGoalView) => {
+  const failed = view.error ? `The board could not be read: ${view.error}` : ''
+  if (!view.goal) return [failed || 'No crew goal is set.', GOAL_USAGE].filter(Boolean).join('\n')
+  const { goal, packages, by, at } = view.goal
+  return [`Crew goal: ${goal}`, `Packages: ${packages.join(', ')}`, `Set ${dayOf(at)}${by ? ` by ${by}` : ''}.`, failed].filter(Boolean).join('\n')
+}
+
+const NOTHING_PENDING: CrewPending = { background: [], wakeups: 0 }
+const pending = atom({ plugin: 'crew', key: 'pending' } as const, NOTHING_PENDING)
+const REFRESH_LABEL = { none: '', due: 'refresh due after this turn', handover: 'handing over', clearing: 'clearing and resuming' } as const
+const HANDOVER_WRITTEN = 'CREW-HANDOVER-WRITTEN'
+const REFRESH_DECLINED = 'CREW-REFRESH-DECLINED'
+
+// Opt-in is kept by the planet's name, not the session id: a /clear starts a new id.
+// `refresh:<name>` holds a percent, or "auto": refresh after a task at AUTO_TASK_PERCENT,
+// and when idle long enough that the prompt cache is about to lapse. The claim and handover
+// limits apply to every session whatever this says; the board's claim is the card boundary.
+const modeOf = async ($: EngineInterface, name: string) => await $.store.get(`refresh:${name}`)
+const isAutoOf = async ($: EngineInterface, name: string) => (await modeOf($, name)) === 'auto'
+const isPackageOf = async ($: EngineInterface, name: string) => (await modeOf($, name)) === 'package'
+const thresholdOf = async ($: EngineInterface, name: string) => {
+  const mode = await modeOf($, name)
+  if (mode === 'auto') return AUTO_TASK_PERCENT
+  return Number(mode) || 0
+}
+
+const handoverPrompt = (path: string) => [
+  `Crew refresh (${OWNER} opted this session in): your task is done and your context is large,`,
+  'so this session will be cleared and restarted from a handover.',
+  'First decide whether that is safe. If you hold an approved but unpushed range, sent a push or tag ask that has',
+  'not been answered yet, are in the middle of a change,',
+  `or are waiting on a reply you must act on, answer exactly ${REFRESH_DECLINED} and one line saying why.`,
+  `Otherwise write your handover to ${path} (replace it if it exists), in the shape of your previous handovers:`,
+  'first rules, what runs, open items in order, pending decisions, gotchas.',
+  `Then answer exactly ${HANDOVER_WRITTEN}.`,
+].join(' ')
+
+// At the handover limit the session may be mid-card: it reaches a safe point first, it does
+// not stop dead, and an approved push is made before anything else (the yes is for that sha).
+const limitPrompt = (path: string, percent: number) => [
+  `Crew handover: your context is at ${percent}%, past the ${HANDOVER_LIMIT}% handover limit, so this session hands over to a fresh one.`,
+  'First reach a safe point: finish the edit you are in, then commit the work or stash it so the working tree is clean.',
+  `If ${OWNER} approved a push you have not made yet, make that push first: that yes is for that exact sha.`,
+  `Then write your handover to ${path} (replace it if it exists): the card id, branch and sha, what is done and what is left,`,
+  'any failing test and what you know about it, and any open question or reply you are waiting on.',
+  `Then answer exactly ${HANDOVER_WRITTEN}. Only if you cannot reach a safe point at all, answer exactly ${REFRESH_DECLINED} and one line saying why.`,
+].join(' ')
+
+const resumePrompt = (name: string, path: string) =>
+  `You are ${name}. The crew mod just refreshed this session. Read your handover ${path}. ` +
+  'If it names an open question or a reply you are waiting on, read your messages first. Then work the board.'
+
+const WAKE_PROMPT =
+  'The crew mod woke this session: it is idle with no card in hand. ' +
+  'Read any messages that came in for you and act on them, then work the board.'
+
+// The board loop, in every session's instructions, so the launcher, a resume and a wake-up
+// only have to say "work the board". One copy; the launcher points at it.
+const boardPrompt = () => [
+  'Crew board: your work comes from the mcl-kanban board on the mesh, reached only through mesh_call.',
+  'Start with mcl-kanban/get_my_cards and finish a card you already hold before taking another.',
+  'Otherwise take the next card with mcl-kanban/claim_next_card (no args): whatever it gives you is yours, in any repo.',
+  'You own only the cards you hold; holding a work package card does not make the cards filed in it yours.',
+  "Do the work the card's GitHub issue describes, then call mcl-kanban/finish_card with the card_id and a one-line result, and close the issue with that same line.",
+  'Stuck on something real: mcl-kanban/block_card with the reason. Handing it back: mcl-kanban/release_card.',
+  `When the board answers board_empty, tell the ${SUPERVISOR} you are free and stop.`,
+  `The crew mod refuses a claim when your context is at ${CLAIM_LIMIT}% or more, and hands you over to a fresh session at ${HANDOVER_LIMIT}%.`,
+  `Nothing is pushed or tagged without ${OWNER}'s yes for the exact sha range.`,
+].join(' ')
+
+const contextPercent = async ($: EngineInterface) => (await $.session.usage()).context.percent ?? 0
+
+const todayLocal = async ($: EngineInterface) =>
+  (await $.process.run(['date', '+%F']).catch(() => null))?.stdout.trim() || new Date().toISOString().slice(0, 10)
+
+// The planet's name now, even before this session's first beat.
+const currentName = async ($: EngineInterface) =>
+  (await read($, me))?.name || (await detectName($, await $.session.id()))
+
+const startHandover = async ($: EngineInterface, name: string, isForced: boolean, isLimit = false) => {
+  const home = (await $.env.get('HOME')) ?? ''
+  const path = `${home}/.claude/sessions/HANDOVER_${await todayLocal($)}_${name}.md`
+  const percent = await contextPercent($)
+  await update($, refreshFlow, () => ({ phase: 'handover' as const, requestedAt: Date.now(), name, path, isForced, isLimit }))
+  await writeBeat($, {})
+  $.clock.after(500, () => void $.prompt.submit({ text: isLimit ? limitPrompt(path, percent) : handoverPrompt(path) }))
+}
+
+const abandonRefresh = async ($: EngineInterface, why: string) => {
+  await update($, refreshFlow, () => IDLE_FLOW)
+  await writeBeat($, {})
+  $.ui.toast(`crew refresh skipped: ${why}`)
+}
+
+// Auto mode's second trigger: idle long enough that the prompt cache is about to lapse,
+// so the next wake-up would resend the whole context at full price anyway.
+const refreshWhenIdle = async ($: EngineInterface) => {
+  const name = await currentName($)
+  if (!(await isAutoOf($, name))) return
+  if ((await read($, refreshFlow)).phase !== 'none') return
+  const held = await read($, me)
+  if (held?.state !== 'idle') return
+  const lastActive = await read($, activeAt)
+  if (lastActive === 0 || (await $.clock.now()) - lastActive < AUTO_IDLE_MS) return
+  const percent = (await $.session.usage()).context.percent ?? 0
+  if (percent < AUTO_IDLE_PERCENT) return
+  await startHandover($, name, false)
+}
+
+// Wake-on-idle. A message does not wake an idle session, so a member that ended its turn waiting
+// would never read it and never take the next card. Never the supervisor: the owner works in that one.
+const wakeWhenIdle = async ($: EngineInterface) => {
+  const name = await currentName($)
+  if (name === SUPERVISOR) return
+  if ((await read($, refreshFlow)).phase !== 'none') return
+  if ((await read($, me))?.state !== 'idle') return
+  const lastActive = await read($, activeAt)
+  if (lastActive === 0) return
+  const now = await $.clock.now()
+  const emptyAt = await read($, boardEmptyAt)
+  if (emptyAt !== 0 && now - emptyAt < BOARD_EMPTY_MS) return
+  const woken = await read($, wakes)
+  const since = Math.max(lastActive, await read($, wokenAt))
+  if (now - since < Math.min(WAKE_MAX_MS, WAKE_AFTER_MS * 2 ** woken)) return
+  await update($, wakes, () => woken + 1)
+  await update($, wokenAt, () => now)
+  if ((await contextPercent($)) >= CLAIM_LIMIT) return startHandover($, name, true)
+  await $.prompt.submit({ text: WAKE_PROMPT })
+}
+
+// At the handover limit a finished turn starts the handover; it runs only on a turn that was not
+// itself part of a refresh, so a declined handover is asked again on the next turn, not at once.
+const handOverAtLimit = async ($: EngineInterface) => {
+  if ((await read($, refreshFlow)).phase !== 'none') return
+  if ((await contextPercent($)) < HANDOVER_LIMIT) return
+  await startHandover($, await currentName($), true, true)
+}
+
+// Records the package of the card just claimed (by name, so the fresh session after a refresh knows
+// it) and says whether package mode wants a handover before the card is started.
+const crossesPackage = async ($: EngineInterface, workPackage: string, percent: number) => {
+  const name = await currentName($)
+  const last = await $.store.get(`package:${name}`)
+  await $.store.set(`package:${name}`, workPackage)
+  if (!(await isPackageOf($, name))) return false
+  if (typeof last !== 'string' || last === '' || last === workPackage) return false
+  if (percent < PACKAGE_MIN_PERCENT) return false
+  if ((await read($, refreshFlow)).phase !== 'none') return false
+  await update($, refreshFlow, flow => ({ ...flow, phase: 'due' as const, isForced: true }))
+  await writeBeat($, {})
+
+  return true
+}
+
+// The tool's answer with one more text block, so the model reads why it must not start.
+const withNote = <T extends { result?: unknown }>(ran: T, note: string): T => {
+  const answer = (ran.result ?? {}) as { content?: unknown[] }
+  const content = Array.isArray(answer.content) ? answer.content : []
+  return { ...ran, result: { ...answer, content: [...content, { type: 'text', text: note }] } }
+}
+
+const procedureOf = (call: { procedure?: unknown }) => String(call.procedure ?? '').replace(/^[0-9a-f]{64}\//i, '')
+const claimedCardOf = (result: unknown) => {
+  const text = JSON.stringify(result ?? '')
+  const cardId = text.match(/(?<!to_)card_id\W+(card-[0-9a-f]{32})/)?.[1]
+  const issueRef = text.match(/issue_ref\W+([\w.-]+\/[\w.-]+#\d+)/)?.[1] ?? ''
+  const workPackage = text.match(/work_package\W+([\w.-]+\/[\w.-]+#\d+)/)?.[1] ?? ''
+
+  return cardId ? { cardId, issueRef, workPackage } : null
+}
+
+// Context used per card, claim to finish: the data the two limits get tuned from.
+const logCardUsage = async ($: EngineInterface, cardId: string, percent: number) => {
+  const started = await read($, cardStart)
+  if (!started || started.cardId !== cardId) return
+  const path = `${await crewDir($)}/card-usage.tsv`
+  const before = (await $.fs.exists(path)) ? await $.fs.read(path) : 'at\tname\tcard\tclaimed_at_percent\tfinished_at_percent\n'
+  const at = new Date(await $.clock.now()).toISOString()
+  await $.fs.write(path, `${before}${at}\t${await currentName($)}\t${cardId}\t${started.percent}\t${percent}\n`)
+  await update($, cardStart, () => null)
+  await writeBeat($, {})
+}
+
+// Runs after every main-loop turn: moves the refresh along, one step a turn.
+const advanceRefresh = async ($: EngineInterface, answer: string) => {
+  const flow = await read($, refreshFlow)
+  if (flow.phase === 'due') {
+    const name = await currentName($)
+    const threshold = await thresholdOf($, name)
+    const percent = (await $.session.usage()).context.percent ?? 0
+    if (!flow.isForced && threshold === 0) return void (await update($, refreshFlow, () => IDLE_FLOW))
+    if (!flow.isForced && percent < threshold) return void (await update($, refreshFlow, () => IDLE_FLOW))
+    if (lastLineOf(answer).endsWith('?')) return abandonRefresh($, 'the session ended its turn on a question')
+    return startHandover($, name, flow.isForced)
+  }
+  if (flow.phase !== 'handover') return
+  if (answer.includes(REFRESH_DECLINED)) return abandonRefresh($, `${flow.name} declined: ${lastLineOf(answer)}`)
+  if (!answer.includes(HANDOVER_WRITTEN)) return abandonRefresh($, 'no handover confirmation')
+  const written = await $.fs.stat(flow.path).catch(() => null)
+  if (!written) return abandonRefresh($, `${flow.path} does not exist`)
+  if (written.mtimeMs < flow.requestedAt) return abandonRefresh($, `handover not written to ${flow.path}`)
+  await update($, refreshFlow, all => ({ ...all, phase: 'clearing' as const }))
+  // Out of the turn's hook: /clear cannot run inside a hook the turn waits on.
+  $.clock.after(500, async () => {
+    await $.command.run({ command: 'clear' })
+    await $.store.set(`name:${await $.session.id()}`, flow.name)
+    await $.store.set(`refreshed:${flow.name}`, Date.now())
+    await update($, tasks, () => ({}))
+    await update($, reported, () => null)
+    await update($, refreshFlow, () => IDLE_FLOW)
+    await writeBeat($, { state: 'idle', lastLine: 'refreshed from handover', lastTool: '' })
+    await $.prompt.submit({ text: resumePrompt(flow.name, flow.path) })
+  })
+}
+
+const PROGRESS_TOOL = 'mcp__crew__report_progress'
+const progressPrompt = () => [
+  `Crew dashboard: ${OWNER} watches every session on a dashboard with a progress bar.`,
+  `Call ${PROGRESS_TOOL} when you start an assigned task (step 0 with your best estimate of steps),`,
+  'after each meaningful step, and once when it is done (step equal to of).',
+  'Keep `task` short (under 60 characters) and name the outcome, not the process. It answers nothing; carry on after it.',
+].join(' ')
+
+// The task list as the session keeps it (TaskCreate/TaskUpdate), counted.
+const fromTasks = (list: Record<string, CrewTask>, at: number): CrewProgress | null => {
+  const all = Object.values(list)
+  if (all.length === 0) return null
+  const current = all.find(task => task.status === 'in_progress') ?? all.find(task => task.status === 'pending')
+  const done = all.filter(task => task.status === 'completed').length
+
+  return { task: current?.subject ?? all.at(-1)?.subject ?? '', step: done, of: all.length, source: 'tasks', at }
+}
+
+const crewDir = async ($: EngineInterface) => `${(await $.env.get('HOME')) ?? '/tmp'}/.claude/crew`
+
+const firstMatch = (texts: string[], pattern: (planet: string) => RegExp) =>
+  texts.flatMap(text => ROSTER.filter(member => pattern(member).test(text)))[0]
+
+// The session's own name, as /rename (or `claude -n`) set it: the last
+// custom-title entry in its transcript.
+const sessionTitle = async ($: EngineInterface, sessionId: string) => {
+  const home = (await $.env.get('HOME')) ?? ''
+  const slug = (await $.session.root()).replace(/[^a-zA-Z0-9]/g, '-')
+  const transcript = `${home}/.claude/projects/${slug}/${sessionId}.jsonl`
+  const found = (await $.fs.exists(transcript))
+    ? await $.process.run(['grep', '-o', '"customTitle":"[^"]*"', transcript]).catch(() => null)
+    : null
+  const last = found?.stdout.trim().split('\n').at(-1) ?? ''
+
+  return last.match(/"customTitle":"([^"]*)"/)?.[1] || undefined
+}
+
+// A second session under a name the terminal already shows is titled "Mars (2)". The
+// suffix is the terminal's, never part of a member's name, and keeping it mints a new
+// member who never goes away: rows are one per name.
+const rosterName = (title: string) => {
+  const bare = title.replace(/\s*\(\d+\)$/, '').trim()
+  return ROSTER.find(member => member.toLowerCase() === bare.toLowerCase()) ?? null
+}
+
+// /crew-name first, then the session's own title when it names a member, then CREW_NAME,
+// the handover the session was pointed at, "you are X", the first planet named, and only
+// last the title as given, for a session that is nobody on the roster.
+const detectName = async ($: EngineInterface, sessionId: string) => {
+  const stored = await $.store.get(`name:${sessionId}`)
+  if (typeof stored === 'string' && stored) return stored
+  const title = (await sessionTitle($, sessionId)) ?? ''
+  const onRoster = rosterName(title)
+  if (onRoster) return onRoster
+  const fromEnv = await $.env.get('CREW_NAME')
+  const texts = (await $.session.messages())
+    .filter(message => message.role === 'user')
+    .slice(0, 6)
+    .map(message => message.text)
+  const named =
+    firstMatch(texts, planet => new RegExp(`HANDOVER_[^\\s]*${planet}`, 'i')) ??
+    firstMatch(texts, planet => new RegExp(`\\byou(?:'re| are)\\s+${planet}\\b`, 'i')) ??
+    firstMatch(texts, planet => new RegExp(`\\b${planet}\\b`, 'i'))
+
+  return fromEnv || named || title || sessionId.slice(0, 8)
+}
+
+const lastLineOf = (answer: string) =>
+  answer.split('\n').map(line => line.trim()).filter(Boolean).at(-1)?.slice(0, 160) ?? ''
+
+// What the session still has in hand once a turn ended, for the "doing" column; '' when nothing.
+const waitingOnOf = async ($: EngineInterface) => {
+  const inFlight = await read($, pending)
+  const progress = await read($, reported)
+  const parts = [
+    ...inFlight.background,
+    ...(inFlight.wakeups > 0 ? [inFlight.wakeups === 1 ? 'a scheduled wake-up' : `${inFlight.wakeups} scheduled wake-ups`] : []),
+    ...(progress && progress.step < progress.of ? [`${progress.task} (${progress.step}/${progress.of})`] : []),
+  ]
+
+  return parts.join(', ')
+}
+
+// The state a finished turn leaves: a question for the owner, work in hand, or nothing.
+const settle = async ($: EngineInterface, lastLine: string) => {
+  if (lastLine.endsWith('?')) return writeBeat($, { state: 'needs-you', lastLine, waitingOn: '' })
+  const waitingOn = await waitingOnOf($)
+
+  return writeBeat($, { state: waitingOn ? 'waiting' : 'idle', lastLine, waitingOn })
+}
+
+const backgroundLabel = (task: { type: string; description: string; command?: string; agent_type?: string }) =>
+  `${task.type === 'subagent' && task.agent_type ? task.agent_type : task.type}: ${(task.description || task.command || '').slice(0, 60)}`
+
+const refreshOf = async ($: EngineInterface, name: string) => {
+  const threshold = await thresholdOf($, name)
+  const { phase } = await read($, refreshFlow)
+  const isPackage = await isPackageOf($, name)
+  if (threshold === 0 && !isPackage && phase === 'none') return null
+  const refreshedAt = Number(await $.store.get(`refreshed:${name}`)) || null
+
+  return { threshold, isAuto: await isAutoOf($, name), isPackage, refreshedAt, phase }
+}
+
+// Sessions that ended in this process (a resume or a fork moved on). Timers started for
+// one keep firing under its id; without this they write a ghost row that never goes offline.
+const ended = new Set<string>()
+
+const writeBeat = async ($: EngineInterface, change: Partial<CrewBeat>) => {
+  const sessionId = await $.session.id()
+  if (ended.has(sessionId)) return
+  const held = await read($, me)
+  const carried = held?.sessionId === sessionId ? held : null
+  const usage = await $.session.usage()
+  const repo = await $.session.repo()
+  const name = change.name ?? (await detectName($, sessionId))
+  const beat: CrewBeat = {
+    sessionId,
+    name,
+    state: carried?.state ?? 'idle',
+    lastTool: carried?.lastTool ?? '',
+    lastLine: carried?.lastLine ?? '',
+    waitingOn: carried?.waitingOn ?? '',
+    progress: await read($, reported),
+    refresh: await refreshOf($, change.name ?? name),
+    card: (await read($, cardStart))?.issueRef ?? '',
+    ...change,
+    repo: repo?.remote?.replace(/^.*[:/]([^/]+\/[^/]+?)(\.git)?$/, '$1') ?? (await $.session.cwd()),
+    model: await $.session.model(),
+    turns: await $.session.turns(),
+    contextPercent: usage.context.percent ?? null,
+    costUsd: usage.cost?.usd ?? null,
+    fiveHourPercent: usage.rateLimits.find(limit => limit.kind === 'five_hour')?.percentUsed ?? null,
+    startedAt: usage.startedAt,
+    beatAt: await $.clock.now(),
+  }
+  await update($, me, () => beat)
+  await $.fs.write(`${await crewDir($)}/${sessionId}.json`, JSON.stringify(beat))
+}
+
+const loadBeats = async ($: EngineInterface) => {
+  const dir = await crewDir($)
+  const entries = (await $.fs.exists(dir)) ? await $.fs.list(dir) : []
+  const now = await $.clock.now()
+  const parsed = await Promise.all(
+    entries
+      .filter(entry => entry.name.endsWith('.json'))
+      .map(entry => {
+        const path = `${dir}/${entry.name}`
+        return $.fs.read(path).then(text => ({ path, beat: JSON.parse(text) as CrewBeat })).catch(() => null)
+      }),
+  )
+  const held = parsed.filter((entry): entry is { path: string; beat: CrewBeat } => entry !== null)
+  // Nothing else deletes these, so without this one file per session ever started piles up.
+  const swept = held.filter(entry => now - entry.beat.beatAt > SWEEP_AFTER_MS).map(entry => entry.path)
+  if (swept.length > 0) await $.process.run(['rm', '-f', ...swept]).catch(() => null)
+  const live = held
+    .filter(entry => !swept.includes(entry.path))
+    .map(entry => entry.beat)
+    .map(beat => ({ ...beat, state: stateOf(beat.state) }))
+    .map(beat => (now - beat.beatAt > OFFLINE_AFTER_MS ? { ...beat, state: 'offline' as CrewState } : beat))
+  // One row per name: the freshest session wins (a /clear or restart leaves the old file behind).
+  const byName = new Map<string, CrewBeat>()
+  live.forEach(beat => {
+    const seen = byName.get(beat.name)
+    if (!seen || seen.beatAt < beat.beatAt) byName.set(beat.name, beat)
+  })
+  const order = (beat: CrewBeat) => {
+    const at = ROSTER.indexOf(beat.name)
+    return at < 0 ? ROSTER.length : at
+  }
+  await update($, beats, () => [...byName.values()].sort((a, b) => order(a) - order(b)))
+}
+
+const ago = (now: number, at: number) => {
+  const seconds = Math.max(0, Math.round((now - at) / 1000))
+  return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.round(seconds / 60)}m` : `${Math.round(seconds / 3600)}h`
+}
+
+const pad = (text: string, width: number) =>
+  text.length > width ? `${text.slice(0, width - 1)}…` : text.padEnd(width)
+
+const STATE_STYLE: Record<CrewState, { glyph: string; color?: string; isDim?: boolean }> = {
+  working: { glyph: '●', color: 'green' },
+  'needs-you': { glyph: '!', color: 'yellow' },
+  waiting: { glyph: '◐', color: 'blue' },
+  idle: { glyph: '○', isDim: true },
+  offline: { glyph: '·', color: 'gray' },
+}
+
+// A beat written by a session still on an older copy of this mod may name a state this one dropped.
+const stateOf = (state: string): CrewState =>
+  state === 'asking' ? 'needs-you' : state in STATE_STYLE ? (state as CrewState) : 'idle'
+
+// A permission dialog that is open, with the row as it stood before it, so the call it
+// stood on clears it once answered and a background subagent's puts the main loop's state back.
+let openDialog: { before: Pick<CrewBeat, 'state' | 'lastLine' | 'lastTool'> | null } | null = null
+
+export const register: Register = (on, options) => {
+  const settings = options as { supervisor?: string; members?: string; owner?: string }
+  SUPERVISOR = settings.supervisor?.trim() || 'Supervisor'
+  OWNER = settings.owner?.trim() || 'the owner'
+  ROSTER = [SUPERVISOR, ...namesOf(settings.members ?? '').filter(name => name !== SUPERVISOR)]
+  on('session.start', async ($, e, next) => {
+    await $.command.register({ name: 'crew', description: 'Open the crew dashboard: every member session at a glance' })
+    await $.command.register({ name: 'crew-name', description: 'Name this session on the crew dashboard: /crew-name Ada' })
+    await $.command.register({ name: 'crew-refresh', description: 'Refresh this session from a handover: after a task, at a package boundary, or now', argumentHint: 'auto|package [all]|on [percent]|off|now' })
+    await $.command.register({ name: 'crew-goal', description: "Show the crew's goal, or set it: /crew-goal <package refs> <sentence>", argumentHint: '[org/repo#n [org/repo#m]] [sentence]' })
+    await $.command.register({ name: 'crew-progress', description: 'Turn progress reporting on or off for this session: /crew-progress off', argumentHint: 'on|off' })
+    await $.tool.register({
+      name: 'report_progress',
+      description:
+        `Report progress on your current assigned task to the crew dashboard ${OWNER} watches. ` +
+        'Call it when you start a task (step 0), after each meaningful step, and once when done (step equal to of). ' +
+        'Returns nothing useful; carry on with your work.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          task: { type: 'string', description: 'The task, short: under 60 characters, naming the outcome' },
+          step: { type: 'integer', minimum: 0, description: 'Steps completed so far' },
+          of: { type: 'integer', minimum: 1, description: 'Total steps, your best current estimate; revise it as you learn' },
+        },
+        required: ['task', 'step', 'of'],
+      },
+    })
+    await writeBeat($, { state: 'idle' })
+    $.clock.every(BEAT_MS, () => void writeBeat($, {}))
+    $.clock.every(REFRESH_MS, () => void loadBeats($))
+    $.clock.every(IDLE_CHECK_MS, () => void refreshWhenIdle($))
+    $.clock.every(IDLE_CHECK_MS, () => void wakeWhenIdle($))
+    $.clock.every(GOAL_MS, () => void loadGoal($))
+    await loadBeats($)
+    void loadGoal($)
+
+    return next(e)
+  })
+
+  on('command.run', { command: 'crew' }, async ($, e) => {
+    if (e.args.trim() === 'close') {
+      await $.ui.close({ id: PANE })
+      return { text: 'Crew dashboard closed.' }
+    }
+    await loadBeats($)
+    await loadGoal($)
+    await $.ui.open({ id: PANE, title: 'Crew' })
+
+    return { text: 'Crew dashboard opened. Close it with /crew close.' }
+  })
+
+  on('command.run', { command: 'crew-goal' }, async ($, e) => {
+    const words = e.args.trim().split(/\s+/).filter(Boolean)
+    if (words.length === 0) return { text: describeGoal(await loadGoal($)) }
+    const packages = words.slice(0, words.findIndex(word => !PACKAGE_REF.test(word)) >>> 0)
+    const goal = words.slice(packages.length).join(' ')
+    if (packages.length < 1 || packages.length > 2 || goal === '') return { text: GOAL_USAGE }
+    const adopted = await askBoard($, 'mcl-kanban/adopt_goal', { goal, packages })
+    if ('error' in adopted) return { text: `The board did not adopt the goal: ${adopted.error}` }
+
+    return { text: describeGoal(await loadGoal($)) }
+  })
+
+  on('command.run', { command: 'crew-name' }, async ($, e) => {
+    const name = e.args.trim()
+    if (!name) return { text: `This session shows as ${(await read($, me))?.name ?? 'unnamed'}. Usage: /crew-name Venus` }
+    await $.store.set(`name:${await $.session.id()}`, name)
+    await writeBeat($, { name })
+    await loadBeats($)
+
+    return { text: `This session now shows as ${name} on the crew dashboard.` }
+  })
+
+  on('turn.start', async ($, e, next) => {
+    // A turn runs here, so this session is live again (resumed back into this process).
+    ended.delete(await $.session.id())
+    const startedNow = await $.clock.now()
+    await update($, activeAt, () => startedNow)
+    await update($, pending, () => NOTHING_PENDING)
+    await writeBeat($, { state: 'working', lastTool: '', waitingOn: '' })
+
+    return next(e)
+  })
+
+  // A menu for the owner is waiting on them. A call that stood on a permission dialog puts
+  // the row back once it resolves: working in a turn, as it was for a background subagent.
+  // A background subagent's other calls leave the row alone: the main loop's state stands.
+  on('tool.call', async ($, e, next) => {
+    const tool = String(e.tool).replace(/^mcp__/, '')
+    const isSubagent = e.agentId !== undefined
+    if (e.tool === 'AskUserQuestion') await writeBeat($, { state: 'needs-you', lastTool: tool, lastLine: 'answer the question menu' })
+    else if (!isSubagent) await writeBeat($, { state: 'working', lastTool: tool })
+    const ran = await next(e)
+    const dialog = openDialog
+    if (e.tool !== 'AskUserQuestion' && dialog === null) return ran
+    openDialog = null
+    await writeBeat($, isSubagent && dialog?.before ? dialog.before : { state: 'working' })
+
+    return ran
+  })
+
+  // Fires before a permission dialog; a settings hook beneath may decide it, then no dialog shows.
+  on('classic.PermissionRequest', async ($, e, next) => {
+    const decided = await next(e)
+    if (decided.decision !== undefined) return decided
+    const held = await read($, me)
+    openDialog = { before: held && held.state !== 'needs-you' ? { state: held.state, lastLine: held.lastLine, lastTool: held.lastTool } : null }
+    const tool = e.tool_name.replace(/^mcp__/, '')
+    await writeBeat($, { state: 'needs-you', lastTool: tool, lastLine: `permission for ${tool}` })
+
+    return decided
+  })
+
+  // The main loop's Stop knows what is still in flight; it may land before or after turn.complete.
+  on('classic.Stop', async ($, e, next) => {
+    const done = await next(e)
+    const inFlight = {
+      background: (e.background_tasks ?? []).map(backgroundLabel),
+      wakeups: (e.session_crons ?? []).length,
+    }
+    await update($, pending, () => inFlight)
+    const held = await read($, me)
+    if (held && held.state !== 'working' && held.state !== 'needs-you') await settle($, held.lastLine)
+
+    return done
+  })
+
+  on('command.run', { command: 'crew-progress' }, async ($, e) => {
+    const key = `progress-off:${await $.session.id()}`
+    const wanted = e.args.trim()
+    if (wanted !== 'on' && wanted !== 'off') {
+      const isOff = (await $.store.get(key)) === 1
+      return { text: `Progress reporting is ${isOff ? 'off' : 'on'} for this session. Usage: /crew-progress on|off` }
+    }
+    await (wanted === 'off' ? $.store.set(key, 1) : $.store.delete(key))
+    if (wanted === 'off') await update($, reported, () => null)
+    await writeBeat($, {})
+
+    return { text: `Progress reporting ${wanted} for this session; it takes effect from the next turn.` }
+  })
+
+  on('command.run', { command: 'crew-refresh' }, async ($, e) => {
+    const name = await currentName($)
+    const [wanted = '', level = ''] = e.args.trim().split(/\s+/)
+    const threshold = await thresholdOf($, name)
+    if (wanted === 'off') {
+      await $.store.delete(`refresh:${name}`)
+      await update($, refreshFlow, () => IDLE_FLOW)
+      await writeBeat($, {})
+      return { text: `Auto-refresh off for ${name}.` }
+    }
+    if (wanted === 'auto') {
+      await $.store.set(`refresh:${name}`, 'auto')
+      await writeBeat($, {})
+      return {
+        text:
+          `Auto-refresh on for ${name}, auto mode: after a finished task at ${AUTO_TASK_PERCENT}% context or more, ` +
+          `and after ${AUTO_IDLE_MS / 60_000} idle minutes at ${AUTO_IDLE_PERCENT}% or more, before the prompt cache lapses.`,
+      }
+    }
+    if (wanted === 'on') {
+      const chosen = Math.min(95, Math.max(5, Number(level) || DEFAULT_THRESHOLD))
+      await $.store.set(`refresh:${name}`, chosen)
+      await writeBeat($, {})
+      return { text: `Auto-refresh on for ${name}: after a finished task, when context is at ${chosen}% or more, it writes its handover and restarts from it.` }
+    }
+    if (wanted === 'package') {
+      const seen = (await read($, beats)).map(beat => beat.name)
+      const members = level === 'all' ? [...new Set([...ROSTER, ...seen])].filter(member => member !== SUPERVISOR) : [name]
+      await Promise.all(members.map(member => $.store.set(`refresh:${member}`, 'package')))
+      await writeBeat($, {})
+      return {
+        text:
+          `Package mode on for ${members.join(', ')}: keeps context across the cards of one work package, and hands over ` +
+          `when the board gives a card from another package, unless context is under ${PACKAGE_MIN_PERCENT}%.`,
+      }
+    }
+    if (wanted === 'now') {
+      await startHandover($, name, true)
+      return { text: `Refreshing ${name} now: it checks it is safe, writes its handover, then clears and resumes.` }
+    }
+    const last = Number(await $.store.get(`refreshed:${name}`)) || 0
+    return {
+      text:
+        `Auto-refresh is ${(await isAutoOf($, name)) ? 'on, auto mode' : (await isPackageOf($, name)) ? 'on, package mode' : threshold ? `on at ${threshold}%` : 'off'} for ${name}` +
+        `${last ? `; last refreshed ${new Date(last).toISOString().slice(0, 16).replace('T', ' ')} UTC` : ''}. ` +
+        `Usage: /crew-refresh auto | package [all] | on [percent] | off | now. Every session also hands over at ${HANDOVER_LIMIT}% and takes no new card at ${CLAIM_LIMIT}%.`,
+    }
+  })
+
+  on('prompt.compose', async ($, e, next) => {
+    const composed = await next(e)
+    const board = { id: 'crew:board', text: boardPrompt(), scope: 'session' as const }
+    const isOff = (await $.store.get(`progress-off:${await $.session.id()}`)) === 1
+    if (isOff) return { ...composed, sections: [...composed.sections, board] }
+
+    return { ...composed, sections: [...composed.sections, board, { id: 'crew:progress', text: progressPrompt(), scope: 'session' as const }] }
+  })
+
+  // The board is the card boundary: a claim at or above the claim limit is refused and turns
+  // into a handover, a claimed card resets the wake backoff, and a finished card is logged.
+  on('tool.call', { tool: MESH_CALL }, async ($, e, next) => {
+    const call = e as unknown as { procedure?: unknown; args?: { card_id?: unknown } }
+    const procedure = procedureOf(call)
+    const isClaim = CLAIMS.includes(procedure)
+    const percent = await contextPercent($)
+    if (isClaim && percent >= CLAIM_LIMIT) {
+      await update($, refreshFlow, flow => (flow.phase === 'none' ? { ...flow, phase: 'due' as const, isForced: true } : flow))
+      return {
+        deny:
+          `Your context is at ${percent}%, at or over the ${CLAIM_LIMIT}% limit for starting a card, so the crew mod refused this claim. ` +
+          'Do not take new work: this session hands over at the end of this turn, and a fresh session takes the next card.',
+      }
+    }
+    const ran = await next(e)
+    if (ran.deny !== undefined || ran.isError === true) return ran
+    const now = await $.clock.now()
+    if (isClaim && JSON.stringify(ran.result ?? '').includes('board_empty')) await update($, boardEmptyAt, () => now)
+    const claimed = isClaim ? claimedCardOf(ran.result) : null
+    if (claimed) {
+      await update($, wakes, () => 0)
+      await update($, boardEmptyAt, () => 0)
+      await update($, cardStart, () => ({ cardId: claimed.cardId, issueRef: claimed.issueRef, percent }))
+      await writeBeat($, {})
+      if (await crossesPackage($, claimed.workPackage, percent)) return withNote(ran, PACKAGE_HANDOVER_NOTE)
+    }
+    if (procedure === 'mcl-kanban/finish_card') await logCardUsage($, String(call.args?.card_id ?? ''), percent)
+
+    return ran
+  })
+
+  on('tool.call', { tool: PROGRESS_TOOL }, async ($, e) => {
+    if ((await $.store.get(`progress-off:${await $.session.id()}`)) === 1) {
+      return { result: 'Progress reporting is off for this session; no need to call this.' }
+    }
+    const input = e as unknown as { task?: unknown; step?: unknown; of?: unknown }
+    const of = Math.max(1, Math.floor(Number(input.of) || 1))
+    const step = Math.min(of, Math.max(0, Math.floor(Number(input.step) || 0)))
+    const task = String(input.task ?? '').slice(0, 80)
+    await update($, reported, () => ({ task, step, of, source: 'report' as const, at: Date.now() }))
+    if (step >= of) await update($, refreshFlow, flow => (flow.phase === 'none' ? { ...flow, phase: 'due' as const } : flow))
+    await writeBeat($, {})
+
+    return { result: `Progress noted: ${step}/${of} ${task}` }
+  })
+
+  on('tool.call', { tool: 'TaskCreate' }, async ($, e, next) => {
+    const ran = await next(e)
+    const id = ran.deny === undefined && ran.isError !== true ? ran.result?.task?.id : undefined
+    if (id === undefined) return ran
+    const list = await update($, tasks, all => ({ ...all, [id]: { subject: e.subject, status: 'pending' as const } }))
+    await update($, reported, () => fromTasks(list, Date.now()))
+    await writeBeat($, {})
+
+    return ran
+  })
+
+  on('tool.call', { tool: 'TaskUpdate' }, async ($, e, next) => {
+    const ran = await next(e)
+    if (ran.deny !== undefined || ran.isError === true) return ran
+    const list = await update($, tasks, all => {
+      const known = all[e.taskId]
+      if (e.status === 'deleted') {
+        const { [e.taskId]: _gone, ...rest } = all
+        return rest
+      }
+      const subject = e.subject ?? known?.subject ?? e.taskId
+      const status = e.status ?? known?.status ?? 'pending'
+      return { ...all, [e.taskId]: { subject, status } }
+    })
+    await update($, reported, () => fromTasks(list, Date.now()))
+    await writeBeat($, {})
+
+    return ran
+  })
+
+  on('tool.call', { tool: 'TodoWrite' }, async ($, e, next) => {
+    const ran = await next(e)
+    if (ran.deny !== undefined || ran.isError === true) return ran
+    const list = Object.fromEntries(e.todos.map((todo, at) => [String(at), { subject: todo.activeForm || todo.content, status: todo.status }]))
+    await update($, tasks, () => list)
+    await update($, reported, () => fromTasks(list, Date.now()))
+    await writeBeat($, {})
+
+    return ran
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const done = await next(e)
+    if (e.agentId !== undefined) return done
+    const lastLine = lastLineOf(e.answer)
+    const endedNow = await $.clock.now()
+    await update($, activeAt, () => endedNow)
+    await settle($, lastLine)
+    const phaseBefore = (await read($, refreshFlow)).phase
+    await advanceRefresh($, e.answer)
+    if (phaseBefore === 'none') await handOverAtLimit($)
+
+    return done
+  })
+
+  on('session.end', async ($, e, next) => {
+    await writeBeat($, { state: 'offline' })
+    ended.add(e.sessionId)
+
+    return next(e)
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const list = await read($, beats)
+    const now = await $.clock.now()
+    const width = Math.max(40, e.props.bodyColumns)
+    const online = list.filter(beat => beat.state !== 'offline')
+    const total = list.reduce((sum, beat) => sum + (beat.costUsd ?? 0), 0)
+    const fiveHour = Math.max(...list.map(beat => beat.fiveHourPercent ?? 0))
+    const lineWidth = Math.max(10, width - 2)
+    const { goal, error } = await read($, goalView)
+
+    return (
+      <Box flexDirection="column">
+        <Box flexDirection="row" justifyContent="space-between">
+          <Text bold>
+            {online.length}/{list.length} online · ${total.toFixed(2)} spent · 5h window {fiveHour.toFixed(0)}%
+          </Text>
+          <Button key="close" label="close" hotkey="x" role="dismiss" onPress={() => $.ui.close({ id: PANE })} />
+        </Box>
+        {goal ? (
+          <Text wrap="truncate-end">
+            <Text color="cyan" bold>goal </Text>
+            {goal.goal} <Text dimColor>· {goal.packages.join(', ')} · set {dayOf(goal.at)}{goal.by ? ` by ${goal.by}` : ''}</Text>
+          </Text>
+        ) : (
+          <Text dimColor wrap="truncate-end">No crew goal set. /crew-goal &lt;package refs&gt; &lt;sentence&gt; sets one.</Text>
+        )}
+        {error !== '' && <Text color="yellow" wrap="truncate-end">board unreachable: {error}</Text>}
+        <Text dimColor>{pad('', 2)}{pad('name', 11)}{pad('state', 10)}{pad('ctx', 5)}{pad('cost', 8)}{pad('turns', 6)}{pad('seen', 5)}repo · doing</Text>
+        {list.length === 0 && <Text dimColor>No planet has checked in yet. Sessions appear as they start with the crew mod loaded.</Text>}
+        {list.map(beat => {
+          const style = STATE_STYLE[beat.state]
+          const isOff = beat.state === 'offline'
+          const activity =
+            beat.state === 'working' && beat.lastTool ? `running ${beat.lastTool}`
+            : beat.state === 'waiting' && beat.waitingOn ? `waiting on ${beat.waitingOn}`
+            : beat.lastLine
+          const doing = beat.card ? `${beat.card} · ${activity}` : activity
+
+          return (
+            <Box flexDirection="column">
+              <Text dimColor={isOff}>
+                <Text color={style.color} dimColor={style.isDim}>{style.glyph} </Text>
+                <Text bold={!isOff}>{pad(beat.name, 11)}</Text>
+                <Text color={style.color} dimColor={style.isDim}>{pad(beat.state, 10)}</Text>
+                <Text color={(beat.contextPercent ?? 0) >= 80 ? 'red' : undefined}>{pad(beat.contextPercent === null ? '-' : `${beat.contextPercent}%`, 5)}</Text>
+                {pad(beat.costUsd === null ? '-' : `$${beat.costUsd.toFixed(2)}`, 8)}
+                {pad(String(beat.turns), 6)}
+                {pad(ago(now, beat.beatAt), 5)}
+                {beat.refresh && <Text color="magenta">↻{beat.refresh.isAuto ? 'auto' : beat.refresh.isPackage ? 'pkg' : `${beat.refresh.threshold}%`} </Text>}
+                {beat.repo}
+              </Text>
+              {beat.progress && !isOff && (() => {
+                const { task, step, of } = beat.progress
+                const isDone = step >= of
+                const filled = Math.round((BAR_CELLS * step) / of)
+
+                return (
+                  <Text wrap="truncate-end">
+                    {'  '}
+                    <Text color={isDone ? 'cyan' : 'green'}>{'█'.repeat(filled)}</Text>
+                    <Text dimColor>{'░'.repeat(BAR_CELLS - filled)}</Text>
+                    {` ${isDone ? 'done' : `${step}/${of}`} `}
+                    <Text dimColor={isDone}>{pad(task, Math.max(10, lineWidth - BAR_CELLS - 10))}</Text>
+                  </Text>
+                )
+              })()}
+              {beat.refresh && beat.refresh.phase !== 'none' && !isOff && (
+                <Text color="magenta">{'  '}↻ {REFRESH_LABEL[beat.refresh.phase]}</Text>
+              )}
+              {doing !== '' && !isOff && <Text dimColor wrap="truncate-end">{'  '}{pad(doing, lineWidth)}</Text>}
+            </Box>
+          )
+        })}
+      </Box>
+    )
+  })
+}
