@@ -21,6 +21,8 @@ Answer `y` to add the marketplace, choose the user scope, then set the plugin's 
 | `supervisor` | The session that coordinates the crew. It is never woken on idle; members report to it. | `Supervisor` |
 | `members` | Member names, comma-separated, in dashboard order. Empty accepts any name. | empty |
 | `owner` | The person who watches the dashboard and whose yes every push needs, as the prompts name them. | `the owner` |
+| `board` | `mesh`: members take work from an mcl-kanban board. `off`: no board. | `mesh` |
+| `realm` | The realm your board is served in (64 hex). Empty uses the macula MCP server's default realm. | empty |
 
 Change them with `/config` or under `pluginConfigs.crew.options` in `~/.claude/settings.json`.
 
@@ -53,9 +55,16 @@ crew ls
 
 It needs kitty with `allow_remote_control yes`. Members are the `ROLE_<Name>.md` cards in `~/.claude/sessions`, plus the supervisor. Environment: `CREW_WORKDIR` (where sessions start, default `$HOME`), `CREW_SUPERVISOR`, `CREW_MODEL`, `CREW_DRY_RUN=1` to print launches.
 
-## The board
+## What you need for what
 
-The board loop talks to [mcl-kanban](https://github.com/macula-services/mcl-kanban) over the Macula mesh, through the `macula` MCP server's `mesh_call`. Without that server the dashboard, progress, limits and handovers still work; the board prompts and `/crew-goal` do not.
+| You want | You need |
+|----------|----------|
+| The dashboard, progress bars, context limits, handovers, package refresh | This plugin. Nothing else. |
+| Members taking work from a shared board, a crew goal, wake-on-idle | The [macula MCP server](https://github.com/macula-io/macula-mcp), a realm your members are enlisted in, and an [mcl-kanban](https://github.com/macula-services/mcl-kanban) service in that realm. Set `realm` to it. |
+
+The board is reached only over the Macula mesh: a member is trusted because its key is signed into the realm. A team that wants its board private runs its own realm on its own network; there is no unauthenticated mode.
+
+When `board` is `mesh` and there is no board for this member (nothing serves `mcl-kanban`, the member is not enlisted, or the macula server is missing), the dashboard says so in one line, the prompt tells members not to call the board, and nobody is woken to work it. Set `board` to `off` to leave the board out entirely.
 
 ## Develop
 

@@ -757,3 +757,53 @@ test('with no members configured, any name is accepted and the prompts name the 
   expect(text).toContain("Ada's yes")
   expect(text).not.toContain('Raf')
 })
+
+// The board setting: mesh (default) reaches mcl-kanban through the macula MCP server, in the configured
+// realm; off leaves the board out entirely. A board that cannot be reached is said once, loudly.
+const REALM = 'ab'.repeat(32)
+
+test('board off: no board rules in the prompt, no wake-ups to work it, /crew-goal says the board is off', { options: { board: 'off' } }, async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Mars']])
+  mock.clock(on, { now: NOW })
+  crewSession(on, store, { percent: 10 })
+  on('prompt.compose', () => ({ sections: [] }) as never)
+
+  const composed = await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: [], tools: [], outputStyle: null, traits: [] } as never)
+  expect(JSON.stringify(composed)).not.toContain('claim_next_card')
+  const goal = await $.command.run({ command: 'crew-goal', args: '' } as never)
+  expect(goal.text).toContain('board is off')
+})
+
+test('board calls go to the configured realm', { options: { realm: REALM } }, async ($, on) => {
+  mock.clock(on, { now: NOW })
+  crewSession(on, new Map(), { percent: 20 })
+  const seen: unknown[] = []
+  on('mcp.call', (_$: unknown, e: { args: unknown }) => {
+    seen.push(e.args)
+    return { value: { content: [{ type: 'text', text: JSON.stringify({ result: {} }) }], isError: false } }
+  })
+  on('prompt.compose', () => ({ sections: [] }) as never)
+
+  await $.command.run({ command: 'crew-goal', args: '' } as never)
+  expect(seen[0]).toMatchObject({ procedure: 'mcl-kanban/get_goal', realm: REALM })
+  const composed = await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: [], tools: [], outputStyle: null, traits: [] } as never)
+  expect(JSON.stringify(composed)).toContain(REALM)
+})
+
+test('a board nobody serves is said on the dashboard and in the prompt, and nobody is woken to work it', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Mars']])
+  mock.clock(on, { now: NOW })
+  crewSession(on, store, { percent: 20 })
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('prompt.compose', () => ({ sections: [] }) as never)
+  on('mcp.call', () => ({ value: { content: [{ type: 'text', text: 'mesh_call failed: no trusted provider advertises the procedure (code=no_provider)' }], isError: true } }))
+
+  await $.command.run({ command: 'crew', args: '' } as never)
+  const ui = await $.ui.mount({
+    plugin: 'crew', surface: 'terminal', component: 'Pane', requestId: 'crew',
+    props: { title: 'Crew', isFocused: false, bodyColumns: 140, placement: 'dock', scroll: { offset: 0, bodyRows: 20 }, view: {} },
+  } as never)
+  expect(await ui.find({ text: /no board/ })).toBeDefined()
+  const composed = await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: [], tools: [], outputStyle: null, traits: [] } as never)
+  expect(JSON.stringify(composed)).toContain('no board')
+})

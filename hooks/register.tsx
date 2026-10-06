@@ -17,6 +17,10 @@ const BAR_CELLS = 14
 let SUPERVISOR = 'Supervisor'
 let OWNER = 'the owner'
 let ROSTER: string[] = [SUPERVISOR]
+// The board: 'mesh' reaches mcl-kanban through the macula MCP server's mesh_call, in REALM (empty is
+// the server's default realm); 'off' leaves the board out of prompts, wake-ups and the dashboard.
+let BOARD: 'mesh' | 'off' = 'mesh'
+let REALM = ''
 const namesOf = (text: string) => text.split(',').map(name => name.trim()).filter(Boolean)
 
 const beats = atom({ plugin: 'crew', key: 'beats' } as const, [])
@@ -70,7 +74,8 @@ const textOf = (blocks: { type: string; text?: string }[]) => blocks.map(block =
 
 // One board procedure over the mesh: its result, or why it failed in the board's or the mesh's words.
 const askBoard = async ($: EngineInterface, procedure: string, args: Record<string, unknown>) => {
-  const answer = await $.mcp.call(MESH_SERVER, 'mesh_call', { procedure, args }).catch((error: unknown) => ({
+  const call = REALM ? { procedure, args, realm: REALM } : { procedure, args }
+  const answer = await $.mcp.call(MESH_SERVER, 'mesh_call', call).catch((error: unknown) => ({
     content: [{ type: 'text', text: String(error) }],
     isError: true,
   }))
@@ -89,6 +94,7 @@ const goalOf = (result: Record<string, unknown>): CrewGoal | null => {
 
 // A failed read keeps the goal last seen and says why, so a mesh hiccup never blanks the goal.
 const loadGoal = async ($: EngineInterface) => {
+  if (BOARD === 'off') return NO_GOAL
   const asked = await askBoard($, 'mcl-kanban/get_goal', {})
   return update($, goalView, seen => ('error' in asked ? { goal: seen.goal, error: asked.error } : { goal: goalOf(asked.result), error: '' }))
 }
@@ -153,8 +159,22 @@ const WAKE_PROMPT =
 
 // The board loop, in every session's instructions, so the launcher, a resume and a wake-up
 // only have to say "work the board". One copy; the launcher points at it.
+// Answers that mean there is no board for this member, as opposed to a slow or failed call.
+const isNoBoard = (error: string) => /no_provider|not_enlisted|not connected|no such server|unknown server|server .* not found/i.test(error)
+const NO_BOARD_HINT = 'install the macula MCP server and get enlisted on the board, or set the crew plugin\'s board option to off'
+
+// The board rules, or, when the board cannot be reached, why not: said once, so nobody keeps calling.
+const boardSection = async ($: EngineInterface) => {
+  if (BOARD === 'off') return null
+  const { error } = await read($, goalView)
+  if (isNoBoard(error)) return `Crew board: no board (${error}). Do not call mcl-kanban procedures; ${NO_BOARD_HINT}.`
+
+  return boardPrompt()
+}
+
 const boardPrompt = () => [
   'Crew board: your work comes from the mcl-kanban board on the mesh, reached only through mesh_call.',
+  ...(REALM ? [`The board is in realm ${REALM}: pass realm ${REALM} on every mcl-kanban mesh_call.`] : []),
   'Start with mcl-kanban/get_my_cards and finish a card you already hold before taking another.',
   'Otherwise take the next card with mcl-kanban/claim_next_card (no args): whatever it gives you is yours, in any repo.',
   'You own only the cards you hold; holding a work package card does not make the cards filed in it yours.',
@@ -207,6 +227,7 @@ const refreshWhenIdle = async ($: EngineInterface) => {
 // Wake-on-idle. A message does not wake an idle session, so a member that ended its turn waiting
 // would never read it and never take the next card. Never the supervisor: the owner works in that one.
 const wakeWhenIdle = async ($: EngineInterface) => {
+  if (BOARD === 'off' || isNoBoard((await read($, goalView)).error)) return
   const name = await currentName($)
   if (name === SUPERVISOR) return
   if ((await read($, refreshFlow)).phase !== 'none') return
@@ -509,7 +530,9 @@ const stateOf = (state: string): CrewState =>
 let openDialog: { before: Pick<CrewBeat, 'state' | 'lastLine' | 'lastTool'> | null } | null = null
 
 export const register: Register = (on, options) => {
-  const settings = options as { supervisor?: string; members?: string; owner?: string }
+  const settings = options as { supervisor?: string; members?: string; owner?: string; board?: string; realm?: string }
+  BOARD = settings.board === 'off' ? 'off' : 'mesh'
+  REALM = /^[0-9a-f]{64}$/i.test(settings.realm?.trim() ?? '') ? (settings.realm ?? '').trim().toLowerCase() : ''
   SUPERVISOR = settings.supervisor?.trim() || 'Supervisor'
   OWNER = settings.owner?.trim() || 'the owner'
   ROSTER = [SUPERVISOR, ...namesOf(settings.members ?? '').filter(name => name !== SUPERVISOR)]
@@ -560,6 +583,7 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'crew-goal' }, async ($, e) => {
+    if (BOARD === 'off') return { text: "The board is off (the crew plugin's board option), so there is no crew goal." }
     const words = e.args.trim().split(/\s+/).filter(Boolean)
     if (words.length === 0) return { text: describeGoal(await loadGoal($)) }
     const packages = words.slice(0, words.findIndex(word => !PACKAGE_REF.test(word)) >>> 0)
@@ -700,11 +724,12 @@ export const register: Register = (on, options) => {
 
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
-    const board = { id: 'crew:board', text: boardPrompt(), scope: 'session' as const }
+    const boardText = await boardSection($)
+    const board = boardText === null ? [] : [{ id: 'crew:board', text: boardText, scope: 'session' as const }]
     const isOff = (await $.store.get(`progress-off:${await $.session.id()}`)) === 1
-    if (isOff) return { ...composed, sections: [...composed.sections, board] }
+    const progress = isOff ? [] : [{ id: 'crew:progress', text: progressPrompt(), scope: 'session' as const }]
 
-    return { ...composed, sections: [...composed.sections, board, { id: 'crew:progress', text: progressPrompt(), scope: 'session' as const }] }
+    return { ...composed, sections: [...composed.sections, ...board, ...progress] }
   })
 
   // The board is the card boundary: a claim at or above the claim limit is refused and turns
@@ -835,15 +860,17 @@ export const register: Register = (on, options) => {
           </Text>
           <Button key="close" label="close" hotkey="x" role="dismiss" onPress={() => $.ui.close({ id: PANE })} />
         </Box>
-        {goal ? (
+        {BOARD === 'mesh' && (goal ? (
           <Text wrap="truncate-end">
             <Text color="cyan" bold>goal </Text>
             {goal.goal} <Text dimColor>· {goal.packages.join(', ')} · set {dayOf(goal.at)}{goal.by ? ` by ${goal.by}` : ''}</Text>
           </Text>
         ) : (
           <Text dimColor wrap="truncate-end">No crew goal set. /crew-goal &lt;package refs&gt; &lt;sentence&gt; sets one.</Text>
+        ))}
+        {error !== '' && (
+          <Text color="yellow" wrap="truncate-end">{isNoBoard(error) ? `no board: ${error} (${NO_BOARD_HINT})` : `board unreachable: ${error}`}</Text>
         )}
-        {error !== '' && <Text color="yellow" wrap="truncate-end">board unreachable: {error}</Text>}
         <Text dimColor>{pad('', 2)}{pad('name', 11)}{pad('state', 10)}{pad('ctx', 5)}{pad('cost', 8)}{pad('turns', 6)}{pad('seen', 5)}repo · doing</Text>
         {list.length === 0 && <Text dimColor>No planet has checked in yet. Sessions appear as they start with the crew mod loaded.</Text>}
         {list.map(beat => {

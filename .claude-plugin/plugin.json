@@ -2,7 +2,10 @@
   "name": "crew",
   "version": "0.2.0",
   "description": "A coding crew of Claude Code sessions: live dashboard, progress bars, a kanban board loop, context limits and handovers",
-  "author": { "name": "macula.io", "url": "https://github.com/macula-io/crew-code" },
+  "author": {
+    "name": "macula.io",
+    "url": "https://github.com/macula-io/crew-code"
+  },
   "homepage": "https://github.com/macula-io/crew-code",
   "license": "MIT",
   "types": "./types/index.d.ts",
@@ -24,6 +27,22 @@
       "title": "Owner",
       "description": "The person who watches the dashboard and whose yes every push needs, as the prompts name them.",
       "default": "the owner"
+    },
+    "board": {
+      "type": "string",
+      "title": "Board",
+      "description": "mesh: members take work from an mcl-kanban board through the macula MCP server. off: no board; the dashboard, progress, limits and handovers still work.",
+      "options": [
+        "mesh",
+        "off"
+      ],
+      "default": "mesh"
+    },
+    "realm": {
+      "type": "string",
+      "title": "Board realm",
+      "description": "The realm your mcl-kanban board is served in, as 64 hex characters. Empty uses the macula MCP server's default realm.",
+      "default": ""
     }
   }
 }
