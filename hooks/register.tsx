@@ -121,6 +121,8 @@ const REFRESH_DECLINED = 'CREW-REFRESH-DECLINED'
 const modeOf = async ($: EngineInterface, name: string) => await $.store.get(`refresh:${name}`)
 const isAutoOf = async ($: EngineInterface, name: string) => (await modeOf($, name)) === 'auto'
 const isPackageOf = async ($: EngineInterface, name: string) => (await modeOf($, name)) === 'package'
+// A member told to stop is parked (`park:<name>`, by name as above): wake-on-idle never wakes it.
+const isParkedOf = async ($: EngineInterface, name: string) => (await $.store.get(`park:${name}`)) === 1
 const thresholdOf = async ($: EngineInterface, name: string) => {
   const mode = await modeOf($, name)
   if (mode === 'auto') return AUTO_TASK_PERCENT
@@ -159,9 +161,10 @@ const resumePrompt = (name: string, path: string) =>
   `You are ${name}. The crew mod just refreshed this session. Read your handover ${path}. ` +
   'If it names an open question or a reply you are waiting on, read your messages first. Then work the board.'
 
-const WAKE_PROMPT =
+const wakePrompt = () =>
   'The crew mod woke this session: it is idle with no card in hand. ' +
-  'Read any messages that came in for you and act on them, then work the board.'
+  'Read any messages that came in for you and act on them, then work the board. ' +
+  `If an earlier instruction told you to stop, that stop stands over this wake-up: say so in one line, ask ${OWNER} to run /crew-park in this session, and end your turn.`
 
 // The board loop, in every session's instructions, so the launcher, a resume and a wake-up
 // only have to say "work the board". One copy; the launcher points at it.
@@ -189,6 +192,7 @@ const boardPrompt = () => [
   `When the board answers board_empty, tell the ${SUPERVISOR} you are free and stop.`,
   `The crew mod refuses a claim when your context is at ${CLAIM_LIMIT}% or more, and hands you over to a fresh session at ${HANDOVER_LIMIT}%.`,
   `Nothing is pushed or tagged without ${OWNER}'s yes for the exact sha range.`,
+  'Name every container or process you start after yourself and stop only those, by exact name; never stop by image or filter.',
 ].join(' ')
 
 const contextPercent = async ($: EngineInterface) => (await $.session.usage()).context.percent ?? 0
@@ -235,7 +239,7 @@ const refreshWhenIdle = async ($: EngineInterface) => {
 const wakeWhenIdle = async ($: EngineInterface) => {
   if (BOARD === 'off' || isNoBoard((await read($, goalView)).error)) return
   const name = await currentName($)
-  if (name === SUPERVISOR) return
+  if (name === SUPERVISOR || (await isParkedOf($, name))) return
   if ((await read($, refreshFlow)).phase !== 'none') return
   if ((await read($, me))?.state !== 'idle') return
   const lastActive = await read($, activeAt)
@@ -249,7 +253,7 @@ const wakeWhenIdle = async ($: EngineInterface) => {
   await update($, wakes, () => woken + 1)
   await update($, wokenAt, () => now)
   if ((await contextPercent($)) >= CLAIM_LIMIT) return startHandover($, name, true)
-  await $.prompt.submit({ text: WAKE_PROMPT })
+  await $.prompt.submit({ text: wakePrompt() })
 }
 
 // At the handover limit a finished turn starts the handover; it runs only on a turn that was not
@@ -488,6 +492,7 @@ const writeBeat = async ($: EngineInterface, change: Partial<CrewBeat>) => {
     progress: await read($, reported),
     refresh: await refreshOf($, change.name ?? name),
     card: (await read($, cardStart))?.issueRef ?? '',
+    isParked: await isParkedOf($, change.name ?? name),
     ...change,
     repo: repo?.remote?.replace(/^.*[:/]([^/]+\/[^/]+?)(\.git)?$/, '$1') ?? (await $.session.cwd()),
     model: await $.session.model(),
@@ -572,6 +577,7 @@ export const register: Register = (on, options) => {
     await $.command.register({ name: 'crew-name', description: 'Name this session on the crew dashboard: /crew-name Ada' })
     await $.command.register({ name: 'crew-refresh', description: 'Refresh this session from a handover: after a task, at a package boundary, or now', argumentHint: 'auto|package [all]|on [percent]|off|now' })
     await $.command.register({ name: 'crew-goal', description: "Show the crew's goal, or set it: /crew-goal <package refs> <sentence>", argumentHint: '[org/repo#n [org/repo#m]] [sentence]' })
+    await $.command.register({ name: 'crew-park', description: 'Park this session so wake-on-idle leaves it alone: /crew-park, and /crew-park off', argumentHint: 'off' })
     await $.command.register({ name: 'crew-progress', description: 'Turn progress reporting on or off for this session: /crew-progress off', argumentHint: 'on|off' })
     await $.tool.register({
       name: 'report_progress',
@@ -689,6 +695,23 @@ export const register: Register = (on, options) => {
     if (held && held.state !== 'working' && held.state !== 'needs-you') await settle($, held.lastLine)
 
     return done
+  })
+
+  on('command.run', { command: 'crew-park' }, async ($, e) => {
+    const name = await currentName($)
+    const wanted = e.args.trim()
+    if (wanted !== '' && wanted !== 'off') {
+      return { text: `${name} is ${(await isParkedOf($, name)) ? 'parked' : 'not parked'}. Usage: /crew-park parks this session, /crew-park off unparks it.` }
+    }
+    await (wanted === 'off' ? $.store.delete(`park:${name}`) : $.store.set(`park:${name}`, 1))
+    await writeBeat($, {})
+    await loadBeats($)
+
+    return {
+      text: wanted === 'off'
+        ? `${name} is unparked: wake-on-idle wakes it again to work the board.`
+        : `${name} is parked: wake-on-idle no longer wakes it, and the dashboard shows it parked. /crew-park off unparks it.`,
+    }
   })
 
   on('command.run', { command: 'crew-progress' }, async ($, e) => {
@@ -927,6 +950,7 @@ export const register: Register = (on, options) => {
                 {pad(String(beat.turns), 6)}
                 {pad(ago(now, beat.beatAt), 5)}
                 {beat.refresh && <Text color="magenta">↻{beat.refresh.isAuto ? 'auto' : beat.refresh.isPackage ? 'pkg' : `${beat.refresh.threshold}%`} </Text>}
+                {beat.isParked && <Text color="yellow">parked </Text>}
                 {beat.repo}
               </Text>
               {beat.progress && !isOff && (() => {

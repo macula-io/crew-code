@@ -44,6 +44,8 @@ export type CrewBeat = {
   refresh: CrewRefresh | null
   // The issue of the card this member holds on the board, or '' (absent in beats from older mods).
   card?: string
+  // Parked with /crew-park: wake-on-idle leaves this member alone (absent in beats from older mods).
+  isParked?: boolean
   startedAt: number
   beatAt: number
 }

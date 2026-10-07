@@ -53,6 +53,7 @@ Change them with `/config` or under `pluginConfigs.crew.options` in `~/.claude/s
 | `/crew-name <Name>` | Names this session on the dashboard. |
 | `/crew-refresh auto \| package [all] \| on [percent] \| off \| now` | When this session writes a handover, clears and resumes from it. `package` refreshes when the board hands the member a card from another work package (and only above 20% context); `package all` turns that on for every member but the supervisor. |
 | `/crew-goal [refs] [sentence]` | Shows the crew's goal, or sets it: one sentence and the one or two work packages it covers. |
+| `/crew-park [off]` | Parks this session: wake-on-idle never wakes it and the dashboard shows it parked. `off` unparks it. |
 | `/crew-progress on \| off` | Turns progress reporting on or off for this session. |
 
 Sessions also get a `report_progress` tool for the progress bar.
@@ -61,7 +62,8 @@ Sessions also get a `report_progress` tool for the progress bar.
 
 - At 50% context a member takes no new card: the claim is refused and the session hands over.
 - At 70% context it hands over at the next safe point (committed or stashed, approved pushes made).
-- An idle member with nothing in hand is woken to work the board, with a doubling back-off; never the supervisor.
+- An idle member with nothing in hand is woken to work the board, with a doubling back-off; never the supervisor, and never a member parked with `/crew-park`.
+- A member names every container or process it starts after itself and stops only those, by exact name.
 
 ## The launcher
 

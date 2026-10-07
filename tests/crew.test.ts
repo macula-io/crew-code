@@ -521,6 +521,62 @@ test('the Supervisor is never woken', async ($, on) => {
   expect(prompts).toEqual([])
 })
 
+test('a parked member is never woken, not even into a handover, until it is unparked', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Mars']])
+  const clock = mock.clock(on, { now: NOW })
+  const context = { percent: 20 }
+  const { prompts, files } = crewSession(on, store, context)
+
+  await $.session.start({ source: 'startup', cwd: '/w' } as never)
+  const parked = await $.command.run({ command: 'crew-park', args: '' } as never)
+  expect(parked.text).toContain('Mars is parked')
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete(answer('Stopped, as told.'))
+  await clock.advance(10 * 60_000)
+  context.percent = 60
+  await clock.advance(10 * 60_000)
+  expect(prompts).toEqual([])
+  expect(JSON.parse(files.get('/home/test/.claude/crew/id-crew.json') ?? '{}').isParked).toBe(true)
+
+  context.percent = 20
+  await $.command.run({ command: 'crew-park', args: 'off' } as never)
+  await clock.advance(2 * 60_000)
+  expect(prompts.length).toBe(1)
+  expect(prompts[0]).toContain('work the board')
+  expect(prompts[0]).toContain('that stop stands')
+})
+
+test('a row on the dashboard shows its member parked', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.env(on, { HOME: '/home/test' })
+  const parked = JSON.stringify({ ...JSON.parse(beat('Mars', 'idle', NOW - 1_000)), isParked: true })
+  on('fs.exists', () => ({ value: true }))
+  on('fs.list', () => ({ value: [{ name: 'mars.json', kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false }] }))
+  on('fs.read', () => ({ value: parked }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+
+  await $.command.run({ command: 'crew', args: '' } as never)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({
+      plugin: 'crew', surface, component: 'Pane', requestId: 'crew',
+      props: { title: 'Crew', isFocused: false, bodyColumns: 140, placement: 'dock', scroll: { offset: 0, bodyRows: 20 }, view: {} },
+    })
+    expect(await ui.find({ text: /parked/ })).toBeDefined()
+  }
+})
+
+test('the board rules tell members to name what they start and stop only that', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Mars']])
+  mock.clock(on, { now: NOW })
+  crewSession(on, store, { percent: 30 })
+  on('prompt.compose', () => ({ sections: [] }) as never)
+
+  const composed = await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: [], tools: [], outputStyle: null, traits: [] } as never)
+  const rules = composed.sections.find((section: { id: string }) => section.id === 'crew:board')
+  expect(rules?.text).toContain('after yourself')
+  expect(rules?.text).toContain('never stop by image or filter')
+})
+
 test('an idle member above the claim limit is woken into a handover, not a card', async ($, on) => {
   const store = new Map<string, unknown>([['name:id-crew', 'Mars']])
   const clock = mock.clock(on, { now: NOW })

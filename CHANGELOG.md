@@ -8,6 +8,7 @@
 - Settings: `supervisor`, `members`, `owner`, `board` (`mesh` or `off`) and `realm`. When there is no board for a member, the dashboard and the prompt say so and nobody is woken to work it.
 - The `crew` launcher (kitty), with `CREW_WORKDIR`, `CREW_SUPERVISOR`, `CREW_MODEL` and `CREW_DRY_RUN`.
 - A marketplace file: `/plugin install crew --marketplace macula-io/crew-code`.
+- `/crew-park` and `/crew-park off`: a parked member is never woken on idle (nor handed over for a wake), and the dashboard shows it parked. The wake prompt says an earlier stop stands over a wake-up, and the board rules tell members to name every container or process they start after themselves and stop only those (#3).
 
 ### Fixed
 - A finished task no longer shows "refresh due after this turn" when that refresh will not run (refresh off, or context under the threshold). The check is made when the task finishes, the same one the turn's end makes (#5).
