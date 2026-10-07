@@ -289,6 +289,23 @@ test('a background agent that ends while the session is idle leaves the row idle
   expect(written.at(-1)).toMatchObject({ state: 'idle', waitingOn: '' })
 })
 
+test('a subagent that stops refreshes the background list: a shell that ended leaves it', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-fovea', 'Uranus']])
+  mock.clock(on, { now: NOW })
+  const written = beatsWritten(on, store)
+  on('classic.Stop', () => ({}) as never)
+  on('classic.SubagentStop', () => ({}) as never)
+  const suite = { id: 'b1', type: 'shell', status: 'running', description: 'cargo test' }
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete(answer('Started the suite.'))
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [suite], session_crons: [] } as never)
+  expect(written.at(-1)).toMatchObject({ state: 'waiting', waitingOn: 'shell: cargo test' })
+
+  await $.classic.SubagentStop({ stop_hook_active: false, agent_id: 'a1', agent_transcript_path: '/t', agent_type: 'Explore', background_tasks: [], session_crons: [] } as never)
+  expect(written.at(-1)).toMatchObject({ state: 'idle', waitingOn: '' })
+})
+
 test('a beat from a session on the older mod still draws: asking shows as needs-you', async ($, on) => {
   const files: Record<string, string> = { 'mars.json': beat('Mars', 'asking', NOW - 1_000, 'Merge it?') }
   mock.clock(on, { now: NOW })
@@ -543,7 +560,30 @@ test('a parked member is never woken, not even into a handover, until it is unpa
   await clock.advance(2 * 60_000)
   expect(prompts.length).toBe(1)
   expect(prompts[0]).toContain('work the board')
-  expect(prompts[0]).toContain('that stop stands')
+  expect(prompts[0]).toContain('call crew_park with parked 1')
+})
+
+test('a member told to stop parks itself with crew_park and is never woken, until it unparks', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Mars']])
+  const clock = mock.clock(on, { now: NOW })
+  const { prompts, files } = crewSession(on, store, { percent: 20 })
+
+  await $.session.start({ source: 'startup', cwd: '/w' } as never)
+  await $.turn.start({ text: 'Stop after this push.', turnId: 't1' })
+  const ran = await $.tool.call({ tool: 'mcp__crew__crew_park', parked: 1, reason: 'the Supervisor said stop' } as never)
+  expect(String(ran.result)).toContain('parked')
+  await $.turn.complete(answer('Parked, as told.'))
+  await clock.advance(20 * 60_000)
+  expect(prompts).toEqual([])
+  expect(store.get('park:Mars')).toBe(1)
+  expect(JSON.parse(files.get('/home/test/.claude/crew/id-crew.json') ?? '{}').isParked).toBe(true)
+
+  await $.turn.start({ text: 'Resume.', turnId: 't2' })
+  await $.tool.call({ tool: 'mcp__crew__crew_park', parked: 0, reason: 'told to resume' } as never)
+  await $.turn.complete(answer('Unparked.', 't2'))
+  await clock.advance(3 * 60_000)
+  expect(store.has('park:Mars')).toBe(false)
+  expect(prompts.length).toBe(1)
 })
 
 test('a row on the dashboard shows its member parked', async ($, on) => {
@@ -575,6 +615,7 @@ test('the board rules tell members to name what they start and stop only that', 
   const rules = composed.sections.find((section: { id: string }) => section.id === 'crew:board')
   expect(rules?.text).toContain('after yourself')
   expect(rules?.text).toContain('never stop by image or filter')
+  expect(rules?.text).toContain('call crew_park')
 })
 
 test('an idle member above the claim limit is woken into a handover, not a card', async ($, on) => {

@@ -8,8 +8,8 @@
 - Settings: `supervisor`, `members`, `owner`, `board` (`mesh` or `off`) and `realm`. When there is no board for a member, the dashboard and the prompt say so and nobody is woken to work it.
 - The `crew` launcher (kitty), with `CREW_WORKDIR`, `CREW_SUPERVISOR`, `CREW_MODEL` and `CREW_DRY_RUN`.
 - A marketplace file: `/plugin install crew --marketplace macula-io/crew-code`.
-- `/crew-park` and `/crew-park off`: a parked member is never woken on idle (nor handed over for a wake), and the dashboard shows it parked. The wake prompt says an earlier stop stands over a wake-up, and the board rules tell members to name every container or process they start after themselves and stop only those (#3).
+- Parking: a parked member is never woken on idle (nor handed over for a wake), and the dashboard shows it parked. A member parks itself with the `crew_park` tool (`parked` 1 or 0, and a reason) when told to stop or wind down, and unparks when told to resume; `/crew-park` and `/crew-park off` are the owner's manual override. A wake-up that finds an earlier stop parks the member and ends the turn. The board rules tell members to name every container or process they start after themselves and stop only those (#3).
 
 ### Fixed
 - A finished task no longer shows "refresh due after this turn" when that refresh will not run (refresh off, or context under the threshold). The check is made when the task finishes, the same one the turn's end makes (#5).
-- A background subagent that ends while its session is idle leaves the dashboard's "waiting on" list at the next beat, so an idle member with nothing live shows idle without a new turn. Background shells still clear at the next turn's end: the plugin API has no live read of them (#5).
+- A background subagent that ends while its session is idle leaves the dashboard's "waiting on" list at the next beat, so an idle member with nothing live shows idle without a new turn. A subagent's Stop hook also refreshes the list, since it carries the session's background work. Otherwise background shells clear at the next turn's end: the plugin API has no live read of them (#5).

@@ -122,7 +122,14 @@ const modeOf = async ($: EngineInterface, name: string) => await $.store.get(`re
 const isAutoOf = async ($: EngineInterface, name: string) => (await modeOf($, name)) === 'auto'
 const isPackageOf = async ($: EngineInterface, name: string) => (await modeOf($, name)) === 'package'
 // A member told to stop is parked (`park:<name>`, by name as above): wake-on-idle never wakes it.
+// The member parks itself with the crew_park tool; /crew-park is the owner's manual override.
+const PARK_TOOL = 'mcp__crew__crew_park'
 const isParkedOf = async ($: EngineInterface, name: string) => (await $.store.get(`park:${name}`)) === 1
+const setParked = async ($: EngineInterface, name: string, isParked: boolean) => {
+  await (isParked ? $.store.set(`park:${name}`, 1) : $.store.delete(`park:${name}`))
+  await writeBeat($, {})
+  await loadBeats($)
+}
 const thresholdOf = async ($: EngineInterface, name: string) => {
   const mode = await modeOf($, name)
   if (mode === 'auto') return AUTO_TASK_PERCENT
@@ -164,7 +171,7 @@ const resumePrompt = (name: string, path: string) =>
 const wakePrompt = () =>
   'The crew mod woke this session: it is idle with no card in hand. ' +
   'Read any messages that came in for you and act on them, then work the board. ' +
-  `If an earlier instruction told you to stop, that stop stands over this wake-up: say so in one line, ask ${OWNER} to run /crew-park in this session, and end your turn.`
+  `If an earlier instruction told you to stop, that stop stands over this wake-up: call crew_park with parked 1 and the reason, say so in one line, and end your turn.`
 
 // The board loop, in every session's instructions, so the launcher, a resume and a wake-up
 // only have to say "work the board". One copy; the launcher points at it.
@@ -193,6 +200,7 @@ const boardPrompt = () => [
   `The crew mod refuses a claim when your context is at ${CLAIM_LIMIT}% or more, and hands you over to a fresh session at ${HANDOVER_LIMIT}%.`,
   `Nothing is pushed or tagged without ${OWNER}'s yes for the exact sha range.`,
   'Name every container or process you start after yourself and stop only those, by exact name; never stop by image or filter.',
+  `When the ${SUPERVISOR} or ${OWNER} tells you to stop or wind down, call crew_park with parked 1 and the reason; when told to resume, call it with parked 0.`,
 ].join(' ')
 
 const contextPercent = async ($: EngineInterface) => (await $.session.usage()).context.percent ?? 0
@@ -444,6 +452,14 @@ const backgroundOf = async ($: EngineInterface, inFlight: { id: string; type: st
   return inFlight.map((task): CrewBackground => (task.type === 'subagent' && known.has(task.id) ? { label: backgroundLabel(task), agentId: task.id } : { label: backgroundLabel(task) }))
 }
 
+// The session's in-flight work as a Stop hook reports it; a row not mid-turn settles on it.
+const takeInFlight = async ($: EngineInterface, e: { background_tasks?: Parameters<typeof backgroundOf>[1]; session_crons?: unknown[] }) => {
+  const inFlight = { background: await backgroundOf($, e.background_tasks ?? []), wakeups: (e.session_crons ?? []).length }
+  await update($, pending, () => inFlight)
+  const held = await read($, me)
+  if (held && held.state !== 'working' && held.state !== 'needs-you') await settle($, held.lastLine)
+}
+
 // A background agent that ends while the session is idle brings no Stop, so the beat reads the
 // session's agents again and one that ended (or that the engine dropped) leaves the "waiting on"
 // list. A background shell has no such read: it stays listed until the next turn's Stop.
@@ -595,6 +611,20 @@ export const register: Register = (on, options) => {
         required: ['task', 'step', 'of'],
       },
     })
+    await $.tool.register({
+      name: 'crew_park',
+      description:
+        `Park or unpark this session on the crew dashboard ${OWNER} watches. A parked member is never woken on idle. ` +
+        `Call it with parked 1 when the ${SUPERVISOR} or ${OWNER} tells you to stop or wind down, and with parked 0 when told to resume.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          parked: { type: 'integer', enum: [0, 1], description: '1 parks this session, 0 unparks it' },
+          reason: { type: 'string', description: 'Who told you to stop or resume, and why, in one line' },
+        },
+        required: ['parked', 'reason'],
+      },
+    })
     await writeBeat($, { state: 'idle' })
     $.clock.every(BEAT_MS, () => void writeBeat($, {}))
     $.clock.every(BEAT_MS, () => void dropEndedAgents($))
@@ -684,15 +714,17 @@ export const register: Register = (on, options) => {
   })
 
   // The main loop's Stop knows what is still in flight; it may land before or after turn.complete.
+  // A subagent's Stop carries the session's in-flight work too, so it refreshes the list between turns.
   on('classic.Stop', async ($, e, next) => {
     const done = await next(e)
-    const inFlight = {
-      background: await backgroundOf($, e.background_tasks ?? []),
-      wakeups: (e.session_crons ?? []).length,
-    }
-    await update($, pending, () => inFlight)
-    const held = await read($, me)
-    if (held && held.state !== 'working' && held.state !== 'needs-you') await settle($, held.lastLine)
+    await takeInFlight($, e)
+
+    return done
+  })
+
+  on('classic.SubagentStop', async ($, e, next) => {
+    const done = await next(e)
+    await takeInFlight($, e)
 
     return done
   })
@@ -703,9 +735,7 @@ export const register: Register = (on, options) => {
     if (wanted !== '' && wanted !== 'off') {
       return { text: `${name} is ${(await isParkedOf($, name)) ? 'parked' : 'not parked'}. Usage: /crew-park parks this session, /crew-park off unparks it.` }
     }
-    await (wanted === 'off' ? $.store.delete(`park:${name}`) : $.store.set(`park:${name}`, 1))
-    await writeBeat($, {})
-    await loadBeats($)
+    await setParked($, name, wanted !== 'off')
 
     return {
       text: wanted === 'off'
@@ -834,6 +864,16 @@ export const register: Register = (on, options) => {
     await writeBeat($, {})
 
     return { result: `Progress noted: ${step}/${of} ${task}` }
+  })
+
+  on('tool.call', { tool: PARK_TOOL }, async ($, e) => {
+    const input = e as unknown as { parked?: unknown; reason?: unknown }
+    const name = await currentName($)
+    const isParked = Number(input.parked) === 1
+    const reason = String(input.reason ?? '').slice(0, 160)
+    await setParked($, name, isParked)
+
+    return { result: isParked ? `${name} is parked (${reason}): wake-on-idle no longer wakes it. End your turn.` : `${name} is unparked (${reason}): wake-on-idle wakes it again to work the board.` }
   })
 
   on('tool.call', { tool: 'TaskCreate' }, async ($, e, next) => {
