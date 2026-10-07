@@ -3,8 +3,10 @@
 // reported task, background work, a scheduled wake-up). idle: nothing in hand.
 export type CrewState = 'working' | 'needs-you' | 'waiting' | 'idle' | 'offline'
 
-// Work still in flight when the turn ended, as the session's Stop hook reported it.
-export type CrewPending = { background: string[]; wakeups: number }
+// Work still in flight when the turn ended, as the session's Stop hook reported it. A background
+// subagent the session's agent list knew then carries its `agentId`, so its end is seen while idle.
+export type CrewBackground = { label: string; agentId?: string }
+export type CrewPending = { background: CrewBackground[]; wakeups: number }
 
 export type CrewProgress = {
   task: string

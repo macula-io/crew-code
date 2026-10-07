@@ -245,6 +245,50 @@ test('background work and wake-ups from the Stop hook keep the session waiting, 
   expect(written.at(-1)?.state).toBe('idle')
 })
 
+test('a finished task shows a refresh due only when that refresh will run', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-fovea', 'Uranus']])
+  mock.clock(on, { now: NOW })
+  const written = beatsWritten(on, store) as unknown as { refresh: { phase: string } | null }[]
+  const finished = { tool: 'mcp__crew__report_progress', task: 'crew states', step: 4, of: 4 } as never
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call(finished)
+  expect(written.at(-1)?.refresh).toBeNull()
+
+  store.set('refresh:Uranus', 60)
+  await $.tool.call(finished)
+  expect(written.at(-1)?.refresh?.phase).toBe('none')
+
+  store.set('refresh:Uranus', 40)
+  await $.tool.call(finished)
+  expect(written.at(-1)?.refresh?.phase).toBe('due')
+})
+
+test('a background agent that ends while the session is idle leaves the row idle without a new turn', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-fovea', 'Uranus']])
+  const clock = mock.clock(on, { now: NOW })
+  const written = beatsWritten(on, store)
+  const agents = [{ id: 'a1', description: 'review the diff', type: 'Explore', status: 'running' }]
+  on('agent.list', () => ({ value: agents }) as never)
+  on('classic.Stop', () => ({}) as never)
+  on('fs.list', () => ({ value: [] }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }) as never)
+  on('tool.register', (_$, e) => ({ value: { tool: `mcp__crew__${e.name}` } }) as never)
+  on('session.start', () => ({ cwd: '/w' }) as never)
+  const review = { id: 'a1', type: 'subagent', status: 'running', description: 'review the diff', agent_type: 'Explore' }
+
+  await $.session.start({ source: 'startup', cwd: '/w' } as never)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete(answer('Review running.'))
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [review], session_crons: [] } as never)
+  await clock.advance(20_000)
+  expect(written.at(-1)).toMatchObject({ state: 'waiting', waitingOn: 'Explore: review the diff' })
+
+  agents[0].status = 'completed'
+  await clock.advance(20_000)
+  expect(written.at(-1)).toMatchObject({ state: 'idle', waitingOn: '' })
+})
+
 test('a beat from a session on the older mod still draws: asking shows as needs-you', async ($, on) => {
   const files: Record<string, string> = { 'mars.json': beat('Mars', 'asking', NOW - 1_000, 'Merge it?') }
   mock.clock(on, { now: NOW })

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { CrewBeat, CrewGoal, CrewGoalView, CrewPending, CrewProgress, CrewRefreshFlow, CrewState, CrewTask } from '../types'
+import type { CrewBackground, CrewBeat, CrewGoal, CrewGoalView, CrewPending, CrewProgress, CrewRefreshFlow, CrewState, CrewTask } from '../types'
 
 const PANE = 'crew'
 const BEAT_MS = 20_000
@@ -125,6 +125,12 @@ const thresholdOf = async ($: EngineInterface, name: string) => {
   const mode = await modeOf($, name)
   if (mode === 'auto') return AUTO_TASK_PERCENT
   return Number(mode) || 0
+}
+// Whether a refresh after a finished task runs: opted in, and the context at the threshold. Asked
+// when the task finishes and again when the turn ends, so the dashboard never shows one that will not.
+const isTaskRefreshDue = async ($: EngineInterface, name: string) => {
+  const threshold = await thresholdOf($, name)
+  return threshold > 0 && ((await $.session.usage()).context.percent ?? 0) >= threshold
 }
 
 const handoverPrompt = (path: string) => [
@@ -304,10 +310,7 @@ const advanceRefresh = async ($: EngineInterface, answer: string) => {
   const flow = await read($, refreshFlow)
   if (flow.phase === 'due') {
     const name = await currentName($)
-    const threshold = await thresholdOf($, name)
-    const percent = (await $.session.usage()).context.percent ?? 0
-    if (!flow.isForced && threshold === 0) return void (await update($, refreshFlow, () => IDLE_FLOW))
-    if (!flow.isForced && percent < threshold) return void (await update($, refreshFlow, () => IDLE_FLOW))
+    if (!flow.isForced && !(await isTaskRefreshDue($, name))) return void (await update($, refreshFlow, () => IDLE_FLOW))
     if (lastLineOf(answer).endsWith('?')) return abandonRefresh($, 'the session ended its turn on a question')
     return startHandover($, name, flow.isForced)
   }
@@ -406,7 +409,7 @@ const waitingOnOf = async ($: EngineInterface) => {
   const inFlight = await read($, pending)
   const progress = await read($, reported)
   const parts = [
-    ...inFlight.background,
+    ...inFlight.background.map(task => task.label),
     ...(inFlight.wakeups > 0 ? [inFlight.wakeups === 1 ? 'a scheduled wake-up' : `${inFlight.wakeups} scheduled wake-ups`] : []),
     ...(progress && progress.step < progress.of ? [`${progress.task} (${progress.step}/${progress.of})`] : []),
   ]
@@ -424,6 +427,34 @@ const settle = async ($: EngineInterface, lastLine: string) => {
 
 const backgroundLabel = (task: { type: string; description: string; command?: string; agent_type?: string }) =>
   `${task.type === 'subagent' && task.agent_type ? task.agent_type : task.type}: ${(task.description || task.command || '').slice(0, 60)}`
+
+// How an agent's loop ends (AgentStatus); a message may resume it, but it is no work in hand.
+const AGENT_ENDED = ['completed', 'failed', 'killed']
+const agentsOf = async ($: EngineInterface) => await $.agent.list().catch(() => null)
+
+// The Stop hook's background work, each subagent the session's agent list names keeping its id.
+const backgroundOf = async ($: EngineInterface, inFlight: { id: string; type: string; description: string; command?: string; agent_type?: string }[]) => {
+  const agents = inFlight.some(task => task.type === 'subagent') ? await agentsOf($) : null
+  const known = new Set((agents ?? []).map(agent => agent.id))
+
+  return inFlight.map((task): CrewBackground => (task.type === 'subagent' && known.has(task.id) ? { label: backgroundLabel(task), agentId: task.id } : { label: backgroundLabel(task) }))
+}
+
+// A background agent that ends while the session is idle brings no Stop, so the beat reads the
+// session's agents again and one that ended (or that the engine dropped) leaves the "waiting on"
+// list. A background shell has no such read: it stays listed until the next turn's Stop.
+const dropEndedAgents = async ($: EngineInterface) => {
+  const inFlight = await read($, pending)
+  if (!inFlight.background.some(task => task.agentId)) return
+  const agents = await agentsOf($)
+  if (agents === null) return
+  const live = new Set(agents.filter(agent => !AGENT_ENDED.includes(agent.status)).map(agent => agent.id))
+  const background = inFlight.background.filter(task => task.agentId === undefined || live.has(task.agentId))
+  if (background.length === inFlight.background.length) return
+  await update($, pending, () => ({ ...inFlight, background }))
+  const held = await read($, me)
+  if (held?.state === 'waiting') await settle($, held.lastLine)
+}
 
 const refreshOf = async ($: EngineInterface, name: string) => {
   const threshold = await thresholdOf($, name)
@@ -560,6 +591,7 @@ export const register: Register = (on, options) => {
     })
     await writeBeat($, { state: 'idle' })
     $.clock.every(BEAT_MS, () => void writeBeat($, {}))
+    $.clock.every(BEAT_MS, () => void dropEndedAgents($))
     $.clock.every(REFRESH_MS, () => void loadBeats($))
     $.clock.every(IDLE_CHECK_MS, () => void refreshWhenIdle($))
     $.clock.every(IDLE_CHECK_MS, () => void wakeWhenIdle($))
@@ -649,7 +681,7 @@ export const register: Register = (on, options) => {
   on('classic.Stop', async ($, e, next) => {
     const done = await next(e)
     const inFlight = {
-      background: (e.background_tasks ?? []).map(backgroundLabel),
+      background: await backgroundOf($, e.background_tasks ?? []),
       wakeups: (e.session_crons ?? []).length,
     }
     await update($, pending, () => inFlight)
@@ -773,7 +805,9 @@ export const register: Register = (on, options) => {
     const step = Math.min(of, Math.max(0, Math.floor(Number(input.step) || 0)))
     const task = String(input.task ?? '').slice(0, 80)
     await update($, reported, () => ({ task, step, of, source: 'report' as const, at: Date.now() }))
-    if (step >= of) await update($, refreshFlow, flow => (flow.phase === 'none' ? { ...flow, phase: 'due' as const } : flow))
+    if (step >= of && (await isTaskRefreshDue($, await currentName($)))) {
+      await update($, refreshFlow, flow => (flow.phase === 'none' ? { ...flow, phase: 'due' as const } : flow))
+    }
     await writeBeat($, {})
 
     return { result: `Progress noted: ${step}/${of} ${task}` }

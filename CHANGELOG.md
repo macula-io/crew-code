@@ -8,3 +8,7 @@
 - Settings: `supervisor`, `members`, `owner`, `board` (`mesh` or `off`) and `realm`. When there is no board for a member, the dashboard and the prompt say so and nobody is woken to work it.
 - The `crew` launcher (kitty), with `CREW_WORKDIR`, `CREW_SUPERVISOR`, `CREW_MODEL` and `CREW_DRY_RUN`.
 - A marketplace file: `/plugin install crew --marketplace macula-io/crew-code`.
+
+### Fixed
+- A finished task no longer shows "refresh due after this turn" when that refresh will not run (refresh off, or context under the threshold). The check is made when the task finishes, the same one the turn's end makes (#5).
+- A background subagent that ends while its session is idle leaves the dashboard's "waiting on" list at the next beat, so an idle member with nothing live shows idle without a new turn. Background shells still clear at the next turn's end: the plugin API has no live read of them (#5).
