@@ -74,7 +74,7 @@ crew rename <Old> <New>
 crew ls
 ```
 
-It needs kitty with `allow_remote_control yes`. Members are the `ROLE_<Name>.md` cards in `~/.claude/sessions`, plus the supervisor. Environment: `CREW_WORKDIR` (where sessions start, default `$HOME`), `CREW_SUPERVISOR`, `CREW_MODEL`, `CREW_DRY_RUN=1` to print launches.
+It needs kitty with `allow_remote_control yes`. Members are the `ROLE_<Name>.md` cards in `~/.claude/sessions`, plus the supervisor. Environment: `CREW_WORKDIR` (where sessions start, default `$HOME`), `CREW_SUPERVISOR`, `CREW_MODEL`, `CREW_DRY_RUN=1` to print launches, `CREW_HOLD=1` to start sessions on hold (they read their card and handover, park themselves and wait to be told to resume).
 
 ## What you need for what
 

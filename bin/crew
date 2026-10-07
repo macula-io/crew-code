@@ -11,6 +11,7 @@
 # Each session runs claude with CREW_NAME=<Name>, MACULA_MCP_AGENT=<name> and -n <Name>.
 # Every session runs on claude-opus-5-5 unless CREW_MODEL says otherwise.
 # Set CREW_DRY_RUN=1 to print the launch instead of running it.
+# Set CREW_HOLD=1 to start sessions on hold: they read their card and handover, then wait.
 set -euo pipefail
 
 SESSIONS="${HOME}/.claude/sessions"
@@ -81,6 +82,9 @@ latest_handover() {
 # The board loop itself is in every session's instructions (the crew mod's board rules), so
 # the launcher only says to work the board. One copy of the rules, in the mod.
 BOARD_LINE="Then work the board, as the crew board rules in your instructions describe."
+# On hold (CREW_HOLD=1) a session takes no work until it is told to: it parks itself and waits.
+HOLD_LINE="You are on hold: do not start work and do not claim cards. Call crew_park with parked 1 and the reason \"started on hold\", tell the ${SUPERVISOR} in one line that you are up, then end your turn and wait until the ${SUPERVISOR} or the owner tells you to resume."
+[[ -n "${CREW_HOLD:-}" ]] && BOARD_LINE="${HOLD_LINE}"
 
 fresh_prompt() {
     local name="$1" card="${SESSIONS}/ROLE_$1.md" handover
