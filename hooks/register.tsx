@@ -171,7 +171,9 @@ const BUDGET_USAGE = 'Usage: /crew-budget shows the budget. /crew-budget fable <
 // A switch into needs-you alerts the owner once: the terminal bell in the session's own kitty tab (a BEL
 // written to the claude process's terminal, which kitty rings and marks on the tab) and a desktop
 // notification. `sound` (crew-wide, /crew-sound) mutes either or both.
-const BELL = 'tty=$(ps -o tty= -p "$PPID" | tr -d " "); [ -n "$tty" ] && [ "$tty" != "?" ] && printf "\\a" > "/dev/$tty"'
+// The shell the engine runs may sit under another one with no terminal, so it walks up the process tree
+// to the first ancestor that has one: the claude process, on the member's kitty tab.
+const BELL = 'p=$PPID; while [ "$p" -gt 1 ]; do t=$(ps -o tty= -p "$p" | tr -d " "); if [ -n "$t" ] && [ "$t" != "?" ]; then printf "\\a" > "/dev/$t"; exit 0; fi; p=$(ps -o ppid= -p "$p" | tr -d " "); done'
 const SOUND_MODES = { on: 'bell and notification', bell: 'bell only', notify: 'notification only', off: 'muted' } as const
 type SoundMode = keyof typeof SOUND_MODES
 const soundOf = async ($: EngineInterface): Promise<SoundMode> => {
