@@ -17,6 +17,8 @@
 
 - Bundled asks: one menu per change (the prompts say to put a change's code range, tag and fleet commit in one ask); routine asks go to the `queue_ask` tool, the dashboard header shows how many wait, and the supervisor offers them together with `take_asks` in one multi-select menu (#13).
 
+- Budget gauges: the dashboard shows the weekly window (percent used, reset) from Claude Code's own rate-limit reading, a projected run-out (red when it comes before the reset), and a Fable gauge the owner sets with `/crew-budget fable <percent>`; the supervisor's prompt reads the same line before assigning (#14).
+
 ### Fixed
 - A finished task no longer shows "refresh due after this turn" when that refresh will not run (refresh off, or context under the threshold). The check is made when the task finishes, the same one the turn's end makes (#5).
 - A background subagent that ends while its session is idle leaves the dashboard's "waiting on" list at the next beat, so an idle member with nothing live shows idle without a new turn. A subagent's Stop hook also refreshes the list, since it carries the session's background work. Otherwise background shells clear at the next turn's end: the plugin API has no live read of them (#5).

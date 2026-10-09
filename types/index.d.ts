@@ -47,12 +47,16 @@ export type CrewBeat = {
   card?: string
   // Parked with /crew-park: wake-on-idle leaves this member alone (absent in beats from older mods).
   isParked?: boolean
+  // The account's weekly window as this session last read it (seven_day): percent used, reset (ms).
+  weekly?: CrewWeekly | null
   startedAt: number
   beatAt: number
 }
 
 // The crew's one goal as the board holds it (mcl-kanban get_goal): the sentence, the work packages
 // it covers, who adopted it and when (ms). `error` names why the last read failed, '' when it worked.
+export type CrewWeekly = { percent: number; resetsAt: number }
+
 export type CrewGoal = { goal: string; packages: string[]; by: string; at: number }
 export type CrewGoalView = { goal: CrewGoal | null; error: string }
 

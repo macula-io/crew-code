@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { CrewBackground, CrewBeat, CrewGoal, CrewGoalView, CrewPending, CrewProgress, CrewRefreshFlow, CrewState, CrewTask } from '../types'
+import type { CrewBackground, CrewBeat, CrewGoal, CrewGoalView, CrewPending, CrewProgress, CrewRefreshFlow, CrewState, CrewTask, CrewWeekly } from '../types'
 
 const PANE = 'crew'
 const BEAT_MS = 20_000
@@ -139,6 +139,35 @@ const askFilesOf = async ($: EngineInterface) => {
   return entries.map(entry => entry.name).filter(name => name.endsWith('.json')).sort().map(name => `${dir}/${name}`)
 }
 const queued = atom({ plugin: 'crew', key: 'asks' } as const, 0)
+// Budget: the weekly window is the engine's own reading (seven_day); the Fable gauge has none, so the
+// owner sets it with /crew-budget. The run-out is projected at the window's average pace so far.
+const WEEK_MS = 7 * 24 * 3600_000
+const weeklyOf = (rateLimits: { kind: string; percentUsed: number; resetsAt?: string }[]): CrewWeekly | null => {
+  const window = rateLimits.find(limit => limit.kind === 'seven_day')
+  const resetsAt = window?.resetsAt ? Date.parse(window.resetsAt) : NaN
+
+  return window && Number.isFinite(resetsAt) ? { percent: window.percentUsed, resetsAt } : null
+}
+const runOutAt = ({ percent, resetsAt }: CrewWeekly, now: number) => {
+  const startedAt = resetsAt - WEEK_MS
+  return percent > 0 && now > startedAt ? startedAt + ((now - startedAt) * 100) / percent : null
+}
+const span = (ms: number) =>
+  ms < 3600_000 ? `${Math.max(1, Math.round(ms / 60_000))}m` : ms < 24 * 3600_000 ? `${Math.round(ms / 3600_000)}h` : `${Math.round(ms / (24 * 3600_000))}d`
+const fableOf = async ($: EngineInterface) => {
+  const held = (await $.store.get('budget:fable').catch(() => undefined)) as { percent?: unknown; at?: unknown } | undefined
+  return held && Number.isFinite(Number(held.percent)) ? { percent: Number(held.percent), at: Number(held.at) || 0 } : null
+}
+const budgetLine = (weekly: CrewWeekly | null, fable: { percent: number; at: number } | null, now: number) => {
+  const runOut = weekly ? runOutAt(weekly, now) : null
+  const parts = [
+    ...(weekly ? [`weekly ${weekly.percent}% · resets in ${span(weekly.resetsAt - now)}`] : []),
+    ...(weekly && runOut !== null && runOut < weekly.resetsAt ? [`runs out in ${span(Math.max(0, runOut - now))}, before the reset`] : []),
+    ...(fable ? [`Fable ${fable.percent}% (set ${span(now - fable.at)} ago)`] : []),
+  ]
+  return parts.join(' · ')
+}
+const BUDGET_USAGE = 'Usage: /crew-budget shows the budget. /crew-budget fable <percent> sets the Fable gauge, /crew-budget fable off clears it.'
 // How long after a refresh its row shows the context it dropped from.
 const REFRESHED_SHOWN_MS = 30 * 60_000
 const isParkedOf = async ($: EngineInterface, name: string) => (await $.store.get(`park:${name}`)) === 1
@@ -576,6 +605,7 @@ const writeBeat = async ($: EngineInterface, change: Partial<CrewBeat>) => {
     contextPercent: usage.context.percent ?? null,
     costUsd: usage.cost?.usd ?? null,
     fiveHourPercent: usage.rateLimits.find(limit => limit.kind === 'five_hour')?.percentUsed ?? null,
+    weekly: weeklyOf(usage.rateLimits),
     startedAt: usage.startedAt,
     beatAt: await $.clock.now(),
   }
@@ -659,6 +689,7 @@ export const register: Register = (on, options) => {
     await $.command.register({ name: 'crew-refresh', description: 'Refresh this session from a handover: after a task, at a package boundary, or now', argumentHint: 'auto|package [all]|on [percent]|off|now' })
     await $.command.register({ name: 'crew-goal', description: "Show the crew's goal, or set it: /crew-goal <package refs> <sentence>", argumentHint: '[org/repo#n [org/repo#m]] [sentence]' })
     await $.command.register({ name: 'crew-park', description: 'Park this session so wake-on-idle leaves it alone: /crew-park, and /crew-park off', argumentHint: 'off' })
+    await $.command.register({ name: 'crew-budget', description: 'Show the budget gauges, or set the Fable one: /crew-budget fable 56', argumentHint: 'fable <percent>|fable off' })
     await $.command.register({ name: 'crew-progress', description: 'Turn progress reporting on or off for this session: /crew-progress off', argumentHint: 'on|off' })
     await $.tool.register({
       name: 'report_progress',
@@ -853,6 +884,19 @@ export const register: Register = (on, options) => {
     return done
   })
 
+  on('command.run', { command: 'crew-budget' }, async ($, e) => {
+    const [gauge = '', value = ''] = e.args.trim().split(/\s+/)
+    const now = await $.clock.now()
+    if (gauge === 'fable' && value === 'off') await $.store.delete('budget:fable')
+    else if (gauge === 'fable' && Number.isFinite(Number(value)) && value !== '') {
+      await $.store.set('budget:fable', { percent: Math.min(100, Math.max(0, Number(value))), at: now })
+    } else if (gauge !== '') return { text: BUDGET_USAGE }
+    const weekly = (await read($, beats)).map(beat => beat.weekly).find(Boolean) ?? weeklyOf((await $.session.usage()).rateLimits)
+    const line = budgetLine(weekly ?? null, await fableOf($), now)
+
+    return { text: `${line ? `Budget: ${line}.` : 'No budget reading yet.'} ${BUDGET_USAGE}` }
+  })
+
   on('command.run', { command: 'crew-park' }, async ($, e) => {
     const name = await currentName($)
     const wanted = e.args.trim()
@@ -940,12 +984,20 @@ export const register: Register = (on, options) => {
     const refresh = [{ id: 'crew:refresh', text: refreshRulePrompt(), scope: 'session' as const }]
     const isSupervisor = (await currentName($)) === SUPERVISOR
     const briefs = isSupervisor ? [{ id: 'crew:briefs', text: briefRulePrompt(), scope: 'session' as const }] : []
+    const line = isSupervisor ? budgetLine(weeklyOf((await $.session.usage()).rateLimits), await fableOf($), await $.clock.now()) : ''
+    const budget = line
+      ? [{
+          id: 'crew:budget',
+          text: `Crew budget: ${line}. Read it before assigning: when the run-out comes before the reset, hold big packages for the reset and assign only small ones.`,
+          scope: 'session' as const,
+        }]
+      : []
     const asks = [
       { id: 'crew:asks', text: asksRulePrompt(), scope: 'session' as const },
       ...(isSupervisor ? [{ id: 'crew:ask-queue', text: takeAsksPrompt(), scope: 'session' as const }] : []),
     ]
 
-    return { ...composed, sections: [...composed.sections, ...board, ...progress, ...refresh, ...briefs, ...asks] }
+    return { ...composed, sections: [...composed.sections, ...board, ...progress, ...refresh, ...briefs, ...asks, ...budget] }
   })
 
   // The board is the card boundary: a claim at or above the claim limit is refused and turns
@@ -1127,6 +1179,8 @@ export const register: Register = (on, options) => {
     const { goal, error } = await read($, goalView)
     const needy = list.filter(beat => beat.state === 'needs-you')
     const waitingAsks = await read($, queued)
+    const freshest = [...online].sort((a, b) => b.beatAt - a.beatAt).map(beat => beat.weekly).find(Boolean) ?? null
+    const budget = budgetLine(freshest, await fableOf($), now)
 
     return (
       <Box flexDirection="column">
@@ -1144,6 +1198,7 @@ export const register: Register = (on, options) => {
           </Text>
           <Button key="close" label="close" hotkey="x" role="dismiss" onPress={() => $.ui.close({ id: PANE })} />
         </Box>
+        {budget !== '' && <Text color={/before the reset/.test(budget) ? 'red' : undefined} wrap="truncate-end">{`budget: ${budget}`}</Text>}
         {BOARD === 'mesh' && (goal ? (
           <Text wrap="truncate-end">
             <Text color="cyan" bold>goal </Text>

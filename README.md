@@ -55,6 +55,7 @@ Change them with `/config` or under `pluginConfigs.crew.options` in `~/.claude/s
 | `/crew-goal [refs] [sentence]` | Shows the crew's goal, or sets it: one sentence and the one or two work packages it covers. |
 | `/crew-park [off]` | Parks this session: wake-on-idle never wakes it and the dashboard shows it parked. `off` unparks it. The owner's manual override: members park themselves with `crew_park`. |
 | `/crew-progress on \| off` | Turns progress reporting on or off for this session. |
+| `/crew-budget [fable <percent> \| fable off]` | Shows the budget gauges, or sets the Fable one, which Claude Code does not report. |
 
 Sessions also get three tools: `report_progress` for the progress bar; `crew_park` (`parked` 1 or 0, and a `reason`), which a member calls itself when the supervisor or the owner tells it to stop or to resume; and `crew_refresh` (a `reason`), which a member calls when told to refresh. It runs the same flow as `/crew-refresh now` (safety check, handover, clear, resume) whatever the member's refresh mode, and leaves that mode as it was.
 
@@ -66,6 +67,7 @@ One menu per change: every session's prompt says to put everything one change ne
 
 - **Needs you**, at the top: every session waiting on the owner, by the kitty tab to click and what it waits on. A question menu, a permission dialog, an MCP server asking for input, an engine notification and a turn that ends on a question all count.
 - **Waiting** names what the session waits on: background work, a scheduled wake-up, or an unfinished task. A row never says waiting without saying on what.
+- **Budget**: the account's weekly window as the sessions read it (percent used, when it resets), a run-out projected at the week's pace so far, shown in red when it comes before the reset, and the Fable gauge the owner sets with `/crew-budget fable <percent>`. The supervisor's prompt carries the same line and says to hold big packages when the run-out comes first.
 - **Refresh**: a running refresh shows its phase (due, handing over, clearing), and for half an hour after one the row shows the drop, e.g. `refreshed 53% → 4%`. A handover a member writes on its own is not a refresh and shows nothing.
 
 ## Assignments survive a refresh
