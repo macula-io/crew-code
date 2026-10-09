@@ -108,3 +108,16 @@ test('crew up with names brings up only those members, each on its own agent', (
   assert.match(tabs[0], /CREW_NAME=Probe/)
   assert.match(tabs[0], /opencode --standalone/)
 })
+
+// #24 follow-up, found live after #24a: `opencode` keeps a resumed session on its stored model (the
+// config's model only seeds fresh sessions, and --help shows no --model flag). Resuming a member
+// configured for another model would run the wrong one, so the launcher starts fresh and says why.
+test('resuming an OpenCode member whose session is on another model starts fresh, with the reason', () => {
+  const dir = home('opencode')
+  writeFileSync(join(dir, '.claude', 'crew', 'ses_gone.json'), JSON.stringify({ sessionId: 'ses_gone', name: 'Probe', state: 'idle', agent: 'opencode', model: 'opencode/big-pickle', beatAt: Date.now() }))
+  const out = execFileSync('bash', [CREW, 'Probe'], { env: { ...process.env, HOME: dir, CREW_DRY_RUN: '1', CREW_AGENT: 'opencode', CREW_OPENCODE_MODEL: 'deepseek/deepseek-flash' }, encoding: 'utf8' })
+
+  assert.match(out, /is on opencode\/big-pickle, not deepseek\/deepseek-flash/)
+  const line = out.split('\n').find(row => row.startsWith('[here]')) ?? ''
+  assert.doesNotMatch(line, /--session ses_gone/)
+})

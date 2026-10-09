@@ -416,18 +416,27 @@ bring_up() {
 }
 
 # An OpenCode member: resumes the OpenCode session its last beat names (OpenCode keeps no per-member
-# transcript the launcher can read, so it starts in CREW_WORKDIR), else starts fresh.
+# transcript the launcher can read, so it starts in CREW_WORKDIR), else starts fresh. A resume keeps the
+# session's stored model, and opencode has no --model flag, so a session on another model than the member
+# is configured for starts fresh instead, with the reason (found live after #24a).
 bring_up_opencode() {
-    local name="$1" mode="$2" where="$3" beat sid
+    local name="$1" mode="$2" where="$3" beat sid want stored
     if [[ "${mode}" == resume ]]; then
         beat="$(last_beat "${name}")"
         sid="${beat%% *}"
         if [[ -n "${sid}" && "$(beat_agent "${sid}")" == opencode ]]; then
-            echo "${name}: resuming OpenCode session ${sid} in ${WORKDIR}"
-            launch "${where}" "${name}" "${WORKDIR}" --session "${sid}" --prompt "$(resume_prompt "${name}")"
-            return 0
+            want="$(opencode_model_for "${name}")"
+            stored="$(jq -r '.model // empty' "${BEATS}/${sid}.json" 2>/dev/null || true)"
+            if [[ -n "${want}" && -n "${stored}" && "${want}" != "${stored}" ]]; then
+                echo "${name}: session ${sid} is on ${stored}, not ${want} (a resume keeps its stored model); starting fresh"
+            else
+                echo "${name}: resuming OpenCode session ${sid} in ${WORKDIR}"
+                launch "${where}" "${name}" "${WORKDIR}" --session "${sid}" --prompt "$(resume_prompt "${name}")"
+                return 0
+            fi
+        else
+            echo "${name}: no earlier OpenCode session found, starting fresh"
         fi
-        echo "${name}: no earlier OpenCode session found, starting fresh"
     fi
     echo "${name}: fresh OpenCode session in ${WORKDIR}"
     launch "${where}" "${name}" "${WORKDIR}" --prompt "$(fresh_prompt "${name}")"
