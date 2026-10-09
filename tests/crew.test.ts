@@ -1249,3 +1249,83 @@ test('the Supervisor reads the budget in its prompt as a measurement, never as a
   expect(budget).toContain("change the crew's pace only when the owner says so")
   expect(budget).not.toMatch(/hold|only small/)
 })
+
+// crew-code#15: a session switching INTO needs-you rings its own tab's bell and shows a desktop
+// notification, once per switch; /crew-sound mutes either or both, crew-wide.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const alerting = (on: any, store: Map<string, unknown>) => {
+  const runs: string[][] = []
+  const written: { state: string }[] = []
+  mock.env(on, { HOME: '/home/test' })
+  on('fs.exists', () => ({ value: false }))
+  on('fs.write', (_$: unknown, e: { text: string }) => { written.push(JSON.parse(e.text)); return { value: undefined } })
+  on('fs.list', () => ({ value: [] }))
+  on('session.id', () => ({ value: 'id-terra' }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000, percent: 20 }, rateLimits: [] } }))
+  on('session.repo', () => ({ value: null }))
+  on('session.cwd', () => ({ value: '/w' }))
+  on('session.root', () => ({ value: '/w' }))
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('session.turns', () => ({ value: 1 }))
+  on('session.messages', () => ({ value: [] }))
+  on('process.run', (_$: unknown, e: { argv: string[] }) => { runs.push(e.argv); return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } })
+  on('store.get', (_$: unknown, e: { key: string }) => ({ value: store.get(e.key) }))
+  on('store.set', (_$: unknown, e: { key: string; value: unknown }) => { store.set(e.key, e.value); return { value: undefined } })
+  on('turn.start', (_$: unknown, e: { turnId: string }) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  const bells = () => runs.filter(argv => argv.join(' ').includes('\\a')).length
+  const notes = () => runs.filter(argv => argv[0] === 'notify-send')
+  return { runs, written, bells, notes }
+}
+
+test('a switch into needs-you rings the bell once and notifies once, naming the member and what waits', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-terra', 'Terra']])
+  mock.clock(on, { now: NOW })
+  const { bells, notes } = alerting(on, store)
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete(answer('Push the fleet commit 3f2a1bc?'))
+  // The row stays needs-you through more beats: no repeat.
+  await $.tool.call({ tool: 'mcp__crew__report_progress', task: 'x', step: 1, of: 2 } as never).catch(() => null)
+
+  expect(bells()).toBe(1)
+  expect(notes()).toHaveLength(1)
+  expect(notes()[0]?.join(' ')).toContain('Terra')
+  expect(notes()[0]?.join(' ')).toContain('Push the fleet commit 3f2a1bc?')
+})
+
+test('a second switch into needs-you after working again alerts again', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-terra', 'Terra']])
+  mock.clock(on, { now: NOW })
+  const { bells, notes } = alerting(on, store)
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete(answer('First?'))
+  await $.turn.start({ text: 'yes', turnId: 't2' })
+  await $.turn.complete(answer('Second?', 't2'))
+
+  expect(bells()).toBe(2)
+  expect(notes()).toHaveLength(2)
+})
+
+test('/crew-sound mutes the bell, the notification or both, crew-wide', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-terra', 'Terra']])
+  mock.clock(on, { now: NOW })
+  const { bells, notes } = alerting(on, store)
+
+  expect((await $.command.run({ command: 'crew-sound', args: 'notify' } as never)).text).toContain('notification only')
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete(answer('One?'))
+  expect([bells(), notes().length]).toEqual([0, 1])
+
+  await $.command.run({ command: 'crew-sound', args: 'bell' } as never)
+  await $.turn.start({ text: 'go', turnId: 't2' })
+  await $.turn.complete(answer('Two?', 't2'))
+  expect([bells(), notes().length]).toEqual([1, 1])
+
+  await $.command.run({ command: 'crew-sound', args: 'off' } as never)
+  await $.turn.start({ text: 'go', turnId: 't3' })
+  await $.turn.complete(answer('Three?', 't3'))
+  expect([bells(), notes().length]).toEqual([1, 1])
+  expect(store.get('sound')).toBe('off')
+})
