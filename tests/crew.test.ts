@@ -1657,3 +1657,31 @@ test('the Supervisor is told to name a model in the brief, members to call crew_
   expect(text).toContain('crew_model')
   expect(text).toMatch(/brief/)
 })
+
+// Other crew files share the beats directory (roster.json, room.json from bin/crew), and a beat from another
+// host or an older mod can lack fields: the pane draws every beat and skips what is not one.
+const STRAY_FILES: Record<string, string> = {
+  'venus.json': beat('Venus', 'working', NOW - 5_000, 'on it'),
+  'roster.json': JSON.stringify({ Venus: 'a'.repeat(64), Terra: 'b'.repeat(64) }),
+  'room.json': JSON.stringify({ room: 'c'.repeat(64), by: 'Supervisor' }),
+  'terra.json': JSON.stringify({ sessionId: 'ses_terra', name: 'Terra', state: 'idle', beatAt: NOW - 1_000, agent: 'opencode' }),
+}
+
+test('the pane draws every beat, skips files that are not beats, and defaults missing fields', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.env(on, { HOME: '/home/test' })
+  on('fs.exists', () => ({ value: true }))
+  on('fs.list', () => ({ value: Object.keys(STRAY_FILES).map(name => ({ name, kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })) }))
+  on('fs.read', (_$, e) => ({ value: STRAY_FILES[e.path.split('/').at(-1) ?? ''] ?? '' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+
+  await $.command.run({ command: 'crew', args: '' } as never)
+
+  const ui = await $.ui.mount({
+    plugin: 'crew', surface: 'terminal', component: 'Pane', requestId: 'crew',
+    props: { title: 'Crew', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 20 }, view: {} },
+  })
+  expect(await ui.find({ text: /2\/2 online/ })).toBeDefined()
+  expect(await ui.find({ text: /Venus/ })).toBeDefined()
+  expect(await ui.find({ text: /Terra/ })).toBeDefined()
+})
