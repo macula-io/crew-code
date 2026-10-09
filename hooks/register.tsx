@@ -268,6 +268,15 @@ const ledgerRulePrompt = (isSupervisor: boolean) =>
     : `your own milestones on a package: ${MEMBER_EVENTS.join(', ')} (a release you shipped, a fix after shipping, a Fable round).`) +
   ' The crew mod logs owner waits, menus, cards and refreshes itself.'
 
+// A review: a subagent whose type names review or an adversary, one asked to run on the reviewer model,
+// or a review skill. A member may also declare one (report_progress phase), which holds across its tool
+// calls until it says working or the turn ends.
+const REVIEWER_MODEL = 'fable'
+const isReviewText = (text: string) => /review|adversar/i.test(text)
+const isReviewCall = (e: { tool: string; subagent_type?: unknown; model?: unknown; skill?: unknown }) =>
+  (e.tool === 'Agent' && (isReviewText(String(e.subagent_type ?? '')) || String(e.model ?? '') === REVIEWER_MODEL)) ||
+  (e.tool === 'Skill' && isReviewText(String(e.skill ?? '')))
+let isReviewDeclared = false
 // How long after a refresh its row shows the context it dropped from.
 const REFRESHED_SHOWN_MS = 30 * 60_000
 const isParkedOf = async ($: EngineInterface, name: string) => (await $.store.get(`park:${name}`)) === 1
@@ -620,8 +629,9 @@ const waitingOnOf = async ($: EngineInterface) => {
 const settle = async ($: EngineInterface, lastLine: string) => {
   if (lastLine.endsWith('?')) return writeBeat($, { state: 'needs-you', lastLine, waitingOn: '' })
   const waitingOn = await waitingOnOf($)
+  const isReviewing = (await read($, pending)).background.some(task => isReviewText(task.label.split(':')[0] ?? ''))
 
-  return writeBeat($, { state: waitingOn ? 'waiting' : 'idle', lastLine, waitingOn })
+  return writeBeat($, { state: isReviewing ? 'reviewing' : waitingOn ? 'waiting' : 'idle', lastLine, waitingOn })
 }
 
 const backgroundLabel = (task: { type: string; description: string; command?: string; agent_type?: string }) =>
@@ -644,7 +654,7 @@ const takeInFlight = async ($: EngineInterface, e: { background_tasks?: Paramete
   const inFlight = { background: await backgroundOf($, e.background_tasks ?? []), wakeups: (e.session_crons ?? []).length }
   await update($, pending, () => inFlight)
   const held = await read($, me)
-  if (held && held.state !== 'working' && held.state !== 'needs-you') await settle($, held.lastLine)
+  if (held && held.state !== 'working' && held.state !== 'reviewing' && held.state !== 'needs-you') await settle($, held.lastLine)
 }
 
 // A background agent that ends while the session is idle brings no Stop, so the beat reads the
@@ -660,7 +670,7 @@ const dropEndedAgents = async ($: EngineInterface) => {
   if (background.length === inFlight.background.length) return
   await update($, pending, () => ({ ...inFlight, background }))
   const held = await read($, me)
-  if (held?.state === 'waiting') await settle($, held.lastLine)
+  if (held?.state === 'waiting' || held?.state === 'reviewing') await settle($, held.lastLine)
 }
 
 const refreshOf = async ($: EngineInterface, name: string) => {
@@ -769,6 +779,7 @@ const pad = (text: string, width: number) =>
 
 const STATE_STYLE: Record<CrewState, { glyph: string; color?: string; isDim?: boolean }> = {
   working: { glyph: '●', color: 'green' },
+  reviewing: { glyph: '◆', color: 'magenta' },
   'needs-you': { glyph: '!', color: 'yellow' },
   waiting: { glyph: '◐', color: 'blue' },
   idle: { glyph: '○', isDim: true },
@@ -815,6 +826,7 @@ export const register: Register = (on, options) => {
           task: { type: 'string', description: 'The task, short: under 60 characters, naming the outcome' },
           step: { type: 'integer', minimum: 0, description: 'Steps completed so far' },
           of: { type: 'integer', minimum: 1, description: 'Total steps, your best current estimate; revise it as you learn' },
+          phase: { type: 'string', enum: ['reviewing', 'working'], description: 'reviewing while you review work (yours or another\'s), working when you are back at it' },
         },
         required: ['task', 'step', 'of'],
       },
@@ -929,6 +941,7 @@ export const register: Register = (on, options) => {
     const startedNow = await $.clock.now()
     await update($, activeAt, () => startedNow)
     await update($, pending, () => NOTHING_PENDING)
+    isReviewDeclared = false
     await writeBeat($, { state: 'working', lastTool: '', waitingOn: '' })
 
     return next(e)
@@ -940,13 +953,19 @@ export const register: Register = (on, options) => {
   on('tool.call', async ($, e, next) => {
     const tool = String(e.tool).replace(/^mcp__/, '')
     const isSubagent = e.agentId !== undefined
-    if (e.tool === 'AskUserQuestion') {
+    const isReview = !isSubagent && isReviewCall(e as unknown as { tool: string })
+    if (isReview) await writeBeat($, { state: 'reviewing', lastTool: tool })
+    else if (e.tool === 'AskUserQuestion') {
       await logEvent($, { event: 'menu', package: await packageOf($) })
       await writeBeat($, { state: 'needs-you', lastTool: tool, lastLine: 'answer the question menu' })
     }
-    else if (!isSubagent) await writeBeat($, { state: 'working', lastTool: tool })
+    else if (!isSubagent) await writeBeat($, { state: isReviewDeclared ? 'reviewing' : 'working', lastTool: tool })
     const ran = await next(e)
     const dialog = openDialog
+    if (isReview && dialog === null) {
+      await writeBeat($, { state: isReviewDeclared ? 'reviewing' : 'working' })
+      return ran
+    }
     if (e.tool !== 'AskUserQuestion' && dialog === null) return ran
     openDialog = null
     await writeBeat($, isSubagent && dialog?.before ? dialog.before : { state: 'working' })
@@ -1188,11 +1207,13 @@ export const register: Register = (on, options) => {
     const of = Math.max(1, Math.floor(Number(input.of) || 1))
     const step = Math.min(of, Math.max(0, Math.floor(Number(input.step) || 0)))
     const task = String(input.task ?? '').slice(0, 80)
+    const phase = (e as unknown as { phase?: unknown }).phase
+    if (phase === 'reviewing' || phase === 'working') isReviewDeclared = phase === 'reviewing'
     await update($, reported, () => ({ task, step, of, source: 'report' as const, at: Date.now() }))
     if (step >= of && (await isTaskRefreshDue($, await currentName($)))) {
       await update($, refreshFlow, flow => (flow.phase === 'none' ? { ...flow, phase: 'due' as const } : flow))
     }
-    await writeBeat($, {})
+    await writeBeat($, phase === 'reviewing' || phase === 'working' ? { state: phase } : {})
 
     return { result: `Progress noted: ${step}/${of} ${task}` }
   })
@@ -1322,6 +1343,7 @@ export const register: Register = (on, options) => {
     const done = await next(e)
     if (e.agentId !== undefined) return done
     const lastLine = lastLineOf(e.answer)
+    isReviewDeclared = false
     const endedNow = await $.clock.now()
     await update($, activeAt, () => endedNow)
     await settle($, lastLine)
@@ -1388,7 +1410,8 @@ export const register: Register = (on, options) => {
           const style = STATE_STYLE[beat.state]
           const isOff = beat.state === 'offline'
           const activity =
-            beat.state === 'working' && beat.lastTool ? `running ${beat.lastTool}`
+            beat.state === 'reviewing' ? `reviewing${beat.waitingOn ? `: ${beat.waitingOn}` : beat.lastTool ? ` with ${beat.lastTool}` : ''}`
+            : beat.state === 'working' && beat.lastTool ? `running ${beat.lastTool}`
             : beat.state === 'waiting' ? `waiting on ${beat.waitingOn || 'nothing it named'}`
             : beat.lastLine
           const doing = beat.card ? `${beat.card} · ${activity}` : activity

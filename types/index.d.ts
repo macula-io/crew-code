@@ -1,7 +1,8 @@
-// working: a turn runs. needs-you: Raf must answer (AskUserQuestion, a permission dialog,
+// reviewing: a turn runs a review (a reviewer subagent or a review skill, or a phase the member declared),
+// or a reviewer still runs in the background after it. working: a turn runs. needs-you: Raf must answer (AskUserQuestion, a permission dialog,
 // a closing question). waiting: the turn ended with work still in hand (an unfinished
 // reported task, background work, a scheduled wake-up). idle: nothing in hand.
-export type CrewState = 'working' | 'needs-you' | 'waiting' | 'idle' | 'offline'
+export type CrewState = 'working' | 'reviewing' | 'needs-you' | 'waiting' | 'idle' | 'offline'
 
 // Work still in flight when the turn ended, as the session's Stop hook reported it. A background
 // subagent the session's agent list knew then carries its `agentId`, so its end is seen while idle.

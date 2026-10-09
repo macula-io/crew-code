@@ -72,6 +72,7 @@ Every session appends to `~/.claude/crew/ledger/<ISO week>/<session>.jsonl`, one
 ## What the dashboard tells you
 
 - **Needs you**, at the top: every session waiting on the owner, by the kitty tab to click and what it waits on. A question menu, a permission dialog, an MCP server asking for input, an engine notification and a turn that ends on a question all count.
+- **Reviewing**: a session running a review, inferred while a reviewer subagent (its type names review or an adversary, or it runs on the `fable` model) or a review skill runs, and while such a reviewer still runs in the background after the turn. A member can declare one with `report_progress`'s `phase` (`reviewing`, then `working`).
 - **Waiting** names what the session waits on: background work, a scheduled wake-up, or an unfinished task. A row never says waiting without saying on what.
 - **Budget**: the account's weekly window as the sessions read it (percent used, when it resets), a run-out projected at the week's pace so far, shown in red when it comes before the reset, and the Fable gauge the owner sets with `/crew-budget fable <percent>`. The supervisor's prompt carries the same line as a measurement for the owner: the crew's pace changes only when the owner says so.
 - **Refresh**: a running refresh shows its phase (due, handing over, clearing), and for half an hour after one the row shows the drop, e.g. `refreshed 53% → 4%`. A handover a member writes on its own is not a refresh and shows nothing.
