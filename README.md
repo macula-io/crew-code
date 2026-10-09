@@ -94,10 +94,12 @@ question or hands over a task shows `waiting on reply from <name>` until the rep
 
 The room is a mesh topic anyone who learns it can read and post on, and a delivered message becomes a prompt. So a
 message is delivered only when the station attests its sender, that sender's node id is on the roster, and it is
-addressed to this session; everything else is dropped and counted on the dashboard row (`room: 3 dropped`). The text is
-fenced as a crew member's words. Only a message from the Supervisor's node id may relay the owner's decision, and
-only with the exact sha range. Never put secrets or private detail in a crew message: the room is not encrypted. The
-rules live in `core/crew_room.ts`, shared by every host; it needs macula-mcp 0.46.1 or later in every member.
+addressed to this session. The dashboard row counts only the messages it refused as a forgery or a stranger
+(`room: 2 refused`); its own messages, ones addressed to another member and the room's lifecycle envelopes are
+ordinary traffic and do not move the count. The text is fenced as a crew member's words. Only a message from the
+Supervisor's node id may relay the owner's decision, and only with the exact sha range. Never put secrets or private
+detail in a crew message: the room is not encrypted. The rules live in `core/crew_room.ts`, shared by every host;
+it needs macula-mcp 0.46.1 or later in every member.
 
 ## Assignments survive a refresh
 

@@ -67,7 +67,7 @@ Claude mod (`core/crew_room.ts`: attested by the station's publisher, sender on 
 and delivers it into the member's session as a queued prompt (`session.prompt`, `delivery: "queue"`). The room rules go
 into the system prompt through the session `context` hook. It works while some macula-mcp process on the machine is in
 the room, which every crew session is. Checked live against OpenCode 2.0.24: an addressed message from a roster member
-became a turn, a forged one and a stranger's were dropped.
+became a turn, while a forged one and a stranger's were refused.
 
 On exit (or when the plugin is unloaded) every member session's beat is written offline at once, so a member that was
 closed can be relaunched right away. A process killed outright writes nothing; `bin/crew` therefore counts an OpenCode

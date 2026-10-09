@@ -52,8 +52,10 @@ export type CrewBeat = {
   weekly?: CrewWeekly | null
   // Why the session runs on another model than its own, '' when it runs on its own (#17).
   modelWhy?: string
-  // Crew room messages this session dropped: not attested, not from the roster, or not addressed to it (#18).
-  roomDropped?: number
+  // Crew room messages this session refused: a forgery (the station does not attest its sender) or a
+  // stranger's (a sender not on the roster). Its own, another member's and lifecycle envelopes are not
+  // counted (#20; named roomDropped before it).
+  roomRefused?: number
   startedAt: number
   beatAt: number
 }
@@ -83,8 +85,8 @@ declare module 'claude-code' {
       // Routine asks queued for the owner (files under the crew directory's asks/), as last counted.
       asks: number
       // The crew room (#18): its topic, this session's node id, the roster, what it waits on (message id -> who),
-      // and how many messages it dropped (core/crew_room.ts decides).
-      room: { topic: string; me: string; roster: Record<string, string>; waiting: Record<string, string>; dropped: number }
+      // and how many messages it refused as a forgery or a stranger (core/crew_room.ts decides; #20).
+      room: { topic: string; me: string; roster: Record<string, string>; waiting: Record<string, string>; refused: number }
     }
   }
 }

@@ -130,7 +130,7 @@ const start = async (ctx: Ctx) => {
       if (limits.size === 0) limits = await limitsOf(ctx)
       const usage = await usageOf(ctx, member, limits)
       const at = { name: NAME, repo, isParked: isParked(), now: Date.now(), startedAt: usage.startedAt, usage }
-      const written = { ...beatOf(member, at), roomDropped }
+      const written = { ...beatOf(member, at), roomRefused }
       lastBeats.set(member.sessionId, written)
       write(`${CREW_DIR}/${member.sessionId}.json`, JSON.stringify(written))
       trace(`beat ${member.sessionId} ${member.state}`)
@@ -180,7 +180,7 @@ const start = async (ctx: Ctx) => {
     const myId = roster[NAME] ?? ''
     const topic = String(readJson(`${CREW_DIR}/room.json`)?.topic ?? '')
     let roomCursor = -1
-    let roomDropped = 0
+    let roomRefused = 0
     // bun:sqlite, as OpenCode runs plugins under Bun; read-only, and opened per read so a missing file is no error.
     const roomRows = async (afterId: number): Promise<TranscriptRow[]> => {
       if (!existsSync(TRANSCRIPT)) return []
@@ -227,13 +227,15 @@ const start = async (ctx: Ctx) => {
         if (!message) continue
         const accepted = acceptEnvelope(message, { me: myId, roster, supervisor: SUPERVISOR })
         if (!accepted.deliver) {
-          if (accepted.reason !== 'own') roomDropped += 1
+          // Same rule as the Claude mod (#20): only a forgery or a stranger counts; its own, another member's
+          // and lifecycle envelopes are ordinary traffic.
+          if (accepted.reason === 'unattested' || accepted.reason === 'not_on_roster') roomRefused += 1
           continue
         }
         trace(`room delivers ${message.message_id} from ${accepted.sender}`)
         await ctx.session.prompt({ sessionID: current, text: fenceDelivery(message, accepted, { boundary: boundary(), owner: OWNER, supervisor: SUPERVISOR }), delivery: 'queue' })
       }
-      if (roomDropped > 0) trace(`room dropped ${roomDropped}`)
+      if (roomRefused > 0) trace(`room refused ${roomRefused}`)
     }
     const roomTimer = setInterval(() => void watchRoom().catch(error => trace(`room watch failed: ${String(error)}`)), ROOM_POLL_MS)
     void watchRoom().catch(() => undefined)

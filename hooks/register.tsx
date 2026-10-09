@@ -92,8 +92,8 @@ const askBoard = async ($: EngineInterface, procedure: string, args: Record<stri
 // ids in roster.json (bin/crew writes it). Watched every ROOM_POLL_MS through the macula server, no model turn:
 // a message is delivered only by core/crew_room.ts's rules (attested, from the roster, addressed here).
 const ROOM_POLL_MS = 10_000
-type CrewRoom = { topic: string; me: string; roster: Roster; waiting: Waiting; dropped: number }
-const NO_ROOM: CrewRoom = { topic: '', me: '', roster: {}, waiting: {}, dropped: 0 }
+type CrewRoom = { topic: string; me: string; roster: Roster; waiting: Waiting; refused: number }
+const NO_ROOM: CrewRoom = { topic: '', me: '', roster: {}, waiting: {}, refused: 0 }
 const crewRoom = atom({ plugin: 'crew', key: 'room' } as const, NO_ROOM)
 
 // One macula MCP tool: its JSON answer, or why it failed.
@@ -150,7 +150,9 @@ const watchCrewRoom = async ($: EngineInterface) => {
 }
 
 const readCrewRoom = async ($: EngineInterface) => {
-  const room = await read($, crewRoom)
+  // A session that was already running when the mod updated keeps the room state it stored before #20 (no
+  // `refused`, and a stale `dropped`), so every field is read over a fresh room's defaults.
+  const room: CrewRoom = { ...NO_ROOM, ...(await read($, crewRoom)) }
   if (!room.topic || !room.me) return
   const key = `room-seq:${await $.session.id()}`
   const held = await $.store.get(key)
@@ -162,21 +164,25 @@ const readCrewRoom = async ($: EngineInterface) => {
     if (typeof page.next_after_seq === 'number') await $.store.set(key, page.next_after_seq)
     return
   }
-  let { waiting, dropped } = room
+  let { waiting, refused } = room
   for (const message of page.messages ?? []) {
     const accepted = acceptEnvelope(message, { me: room.me, roster: room.roster, supervisor: SUPERVISOR })
     if (typeof message.seq === 'number') await $.store.set(key, message.seq)
     if (accepted.deliver) {
       waiting = waitingOn(waiting, { type: 'received', inReplyTo: message.in_reply_to })
       await $.prompt.submit({ text: fenceDelivery(message, accepted, { boundary: boundary(), owner: OWNER, supervisor: SUPERVISOR }) })
-    } else if (accepted.reason !== 'own') dropped += 1
+    } else if (accepted.reason === 'unattested' || accepted.reason === 'not_on_roster') {
+      // Only a forgery or a stranger is the row's count (#20): its own, another member's and lifecycle
+      // envelopes are ordinary traffic and must not make it climb.
+      refused += 1
+    }
   }
   if (typeof page.next_after_seq === 'number') await $.store.set(key, page.next_after_seq)
   const answered = Object.keys(waiting).length < Object.keys(room.waiting).length
-  await update($, crewRoom, held => ({ ...held, waiting, dropped }))
+  await update($, crewRoom, held => ({ ...held, waiting, refused }))
   const beat = await read($, me)
   if (answered && beat?.state === 'waiting') return settle($, beat.lastLine)
-  if (dropped !== room.dropped) await writeBeat($, {})
+  if (refused !== room.refused) await writeBeat($, {})
 }
 
 // A mesh_say this session sent that expects a reply: it waits on the recipients until one names it.
@@ -867,7 +873,7 @@ const writeBeat = async ($: EngineInterface, change: Partial<CrewBeat>) => {
     fiveHourPercent: usage.rateLimits.find(limit => limit.kind === 'five_hour')?.percentUsed ?? null,
     weekly: weeklyOf(usage.rateLimits),
     modelWhy: await modelWhyOf($, change.name ?? name),
-    roomDropped: (await read($, crewRoom)).dropped,
+    roomRefused: (await read($, crewRoom)).refused,
     startedAt: usage.startedAt,
     beatAt: await $.clock.now(),
   }
@@ -1682,7 +1688,7 @@ export const register: Register = (on, options) => {
                 {beat.repo}
                 {beat.model ? <Text dimColor>{` · ${beat.model.replace(/^claude-/, '')}`}</Text> : null}
                 {beat.modelWhy ? <Text color="cyan">{` ${beat.modelWhy}`}</Text> : null}
-                {beat.roomDropped ? <Text color="yellow">{` · room: ${beat.roomDropped} dropped`}</Text> : null}
+                {beat.roomRefused ? <Text color="yellow">{` · room: ${beat.roomRefused} refused`}</Text> : null}
               </Text>
               {beat.progress && !isOff && (() => {
                 const { task, step, of } = beat.progress

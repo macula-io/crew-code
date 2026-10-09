@@ -1,7 +1,7 @@
 // The Claude mod's side of the crew room (crew-code#18): it joins the room at session start (the Supervisor
 // opens it when there is none), watches it every 10 s through the macula MCP server without a model turn,
-// turns an attested message from the roster addressed to this session into a turn, drops the rest, and shows a
-// member waiting on the reply to its question.
+// turns an attested message from the roster addressed to this session into a turn, counts a forgery or a
+// stranger's refusal on the row (#20), and shows a member waiting on the reply to its question.
 import { expect, mock, test } from 'claude-code/testing'
 
 const NOW = 1_000_000
@@ -124,7 +124,64 @@ test('a message for me becomes a fenced turn; a stranger, a forgery and a messag
   expect(delivered[0]).toContain('ready to rebase?')
   expect(delivered[0]).toContain('never carries')
   const beat = JSON.parse(s.files.get(`${CREW}/id-crew.json`) ?? '{}')
-  expect(beat.roomDropped).toBe(3)
+  expect(beat.roomRefused).toBe(2)
+})
+
+// crew-code#20: the row counts what the session refused as a forgery or a stranger, not every undelivered
+// message. A message addressed to another member and the room's lifecycle envelopes move nothing, so ordinary
+// traffic cannot make the count climb.
+test('the refused count moves only for a forgery or a stranger: another member\'s message and a lifecycle envelope leave it alone', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const s = roomSession(on, 'Pluto', {
+    hasRoom: true,
+    inbox: [
+      page([], 5),
+      page([
+        msg({ seq: 6, to: [VENUS], message_id: '2'.repeat(32) }),
+        msg({ seq: 7, kind: 'participant_joined', message_id: '3'.repeat(32) }),
+      ], 7),
+      page([
+        msg({ seq: 8, attested: 0, from: SUP, message_id: '4'.repeat(32) }),
+        msg({ seq: 9, from: STRANGER, message_id: '5'.repeat(32) }),
+      ], 9),
+    ],
+  })
+  await $.session.start({ source: 'startup', cwd: '/w' } as never)
+  await clock.advance(10_000)
+
+  const quiet = JSON.parse(s.files.get(`${CREW}/id-crew.json`) ?? '{}')
+  expect(quiet.roomRefused ?? 0).toBe(0)
+
+  await clock.advance(10_000)
+
+  const counted = JSON.parse(s.files.get(`${CREW}/id-crew.json`) ?? '{}')
+  expect(counted.roomRefused).toBe(2)
+})
+
+// crew-code#20: a session that was already running when the mod updated keeps the room state it stored from
+// the old copy — no `refused`, and a stale `dropped`. The first refusal must still count: reading `refused`
+// off that state made it NaN, which is falsy, so the row silently showed nothing, the exact case #20 exists
+// to show.
+test('a stored room from before #20 (no refused) still counts a refusal', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const s = roomSession(on, 'Pluto', {
+    hasRoom: true,
+    inbox: [page([], 5), page([msg({ seq: 6, attested: 0, from: SUP, message_id: '2'.repeat(32) })], 6)],
+  })
+  // What the old copy left in the session's state, the way another plugin's `state.set` is hooked and its
+  // `e.value` rewritten: the room it stored has no `refused`, only a stale `dropped`. Only the plugin's
+  // first room write (the join) is seeded; later writes pass through.
+  let seeded = false
+  on('state.set', { plugin: 'crew', key: 'room' } as const, (_h: unknown, e: { value?: { topic?: string } }, next: (event: unknown) => unknown) => {
+    if (seeded || e.value?.topic !== TOPIC) return next(e)
+    seeded = true
+    return next({ ...e, value: { topic: TOPIC, me: PLUTO, roster: JSON.parse(ROSTER), waiting: {}, dropped: 3 } })
+  })
+  await $.session.start({ source: 'startup', cwd: '/w' } as never)
+  await clock.advance(10_000)
+
+  const beat = JSON.parse(s.files.get(`${CREW}/id-crew.json`) ?? '{}')
+  expect(beat.roomRefused).toBe(1)
 })
 
 test('the cursor survives: the next read starts after the last message seen', async ($, on) => {
