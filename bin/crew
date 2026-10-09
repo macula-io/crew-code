@@ -139,10 +139,11 @@ is_live() {
 }
 
 # The CREW_NAME from a process's NUL-separated environment, if it has one. Bash-native (mapfile), so a
-# long environment can never SIGPIPE a reader mid-scan.
+# long environment can never SIGPIPE a reader mid-scan. 2>/dev/null comes before the input redirect:
+# bash reports the input-redirect failure before the stderr redirect applies (found live, #24a).
 crew_name_of() {
     local -a entries=()
-    mapfile -d '' -t entries <"$1" 2>/dev/null || true
+    mapfile -d '' -t entries 2>/dev/null <"$1" || true
     local entry
     for entry in "${entries[@]}"; do
         [[ "${entry}" == CREW_NAME=* ]] && { printf '%s\n' "${entry#CREW_NAME=}"; return 0; }
