@@ -101,6 +101,14 @@ Supervisor's node id may relay the owner's decision, and only with the exact sha
 detail in a crew message: the room is not encrypted. The rules live in `core/crew_room.ts`, shared by every host;
 it needs macula-mcp 0.46.1 or later in every member.
 
+One message_id is one turn per member, and the receiving host acknowledges the delivery: after a message enters a
+session the mod publishes a `message_delivered` fact on the room (no model turn), carrying the message id, the member
+and sender node ids, and when. The supervisor lists its instructions with `crew_receipts` — delivered / acknowledged /
+pending — and a row shows `room: 2 pending >10m` when an instruction passed ten minutes without a receipt (a receipt
+counts only when the transcript's station-attested publisher is one of the recipients). An OpenCode member's host
+cannot publish a receipt yet (its plugin API has no MCP call; the note is in crew-code#24): its lines read `no
+receipt (host cannot publish yet)` and are never flagged pending.
+
 ## Assignments survive a refresh
 
 A refresh clears the member's chat, so its assignment lives outside it: the card it holds on the board, and the supervisor's brief file `~/.claude/sessions/BRIEF_<YYYY-MM-DD>_<Name>.md` (the supervisor's prompt tells it to write one with each assignment). The resume prompt points the fresh session at both, as well as at its handover.
@@ -128,7 +136,8 @@ crew ls
 shell. A headless member runs in a detached tmux session the owner can attach to (`tmux attach -t crew-<name>`); `stop`
 kills exactly the member's own process group, and `ls` shows each member's live agent and macula-mcp process counts.
 The supervisor does the same through the `crew_restart` tool, so a stalled member or a fix that needs a relaunch no
-longer waits for the owner. Members are the `ROLE_<Name>.md` cards in `~/.claude/sessions`, plus the supervisor. Environment: `CREW_WORKDIR` (where sessions start, default `$HOME`), `CREW_SUPERVISOR`, `CREW_MODEL` (overrides `member_models` and `worker_model` for every session), `CREW_DRY_RUN=1` to print launches, `CREW_HOLD=1` to start sessions on hold (they read their card and handover, park themselves and wait to be told to resume).
+longer waits for the owner. An OpenCode member whose session stored another model than the member is configured for
+starts fresh on a resume, with the reason (`opencode` keeps a resumed session on its stored model). Members are the `ROLE_<Name>.md` cards in `~/.claude/sessions`, plus the supervisor. Environment: `CREW_WORKDIR` (where sessions start, default `$HOME`), `CREW_SUPERVISOR`, `CREW_MODEL` (overrides `member_models` and `worker_model` for every session), `CREW_DRY_RUN=1` to print launches, `CREW_HOLD=1` to start sessions on hold (they read their card and handover, park themselves and wait to be told to resume).
 
 `CREW_AGENT=opencode crew <Name>` starts that member on OpenCode instead, on `CREW_OPENCODE_MODEL` (`provider/model`). It shows on the same dashboard; what maps and what does not is in [hosts/opencode/README.md](hosts/opencode/README.md) (a prototype).
 

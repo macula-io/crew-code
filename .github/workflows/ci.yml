@@ -26,5 +26,6 @@ jobs:
       - name: Run the OpenCode adapter's tests
         # macula.node-test.ts is the #23 integration test: it skips unless an OpenCode 2 binary is on PATH (CI has
         # none: v2 is not on npm and anomalyco/opencode's public releases stop at v1.18.35). lifecycle.node-test.ts
-        # is the #24 one: it skips unless tmux is on PATH.
-        run: node --experimental-strip-types --test hosts/opencode/beat.node-test.ts hosts/opencode/room.node-test.ts hosts/opencode/launcher.node-test.ts hosts/opencode/server.node-test.ts hosts/opencode/macula.node-test.ts hosts/opencode/lifecycle.node-test.ts
+        # is the #24 one: it skips unless tmux is on PATH. receipts.node-test.ts is the #24b live proof (real claude,
+        # real mesh): it skips unless CREW_LIVE_RECEIPTS=1.
+        run: node --experimental-strip-types --test hosts/opencode/beat.node-test.ts hosts/opencode/room.node-test.ts hosts/opencode/launcher.node-test.ts hosts/opencode/server.node-test.ts hosts/opencode/macula.node-test.ts hosts/opencode/lifecycle.node-test.ts hosts/opencode/receipts.node-test.ts

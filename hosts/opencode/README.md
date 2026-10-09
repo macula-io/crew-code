@@ -11,13 +11,15 @@ room and server parts in `room.ts` and `server.ts`, with tests:
 ```sh
 node --experimental-strip-types --test hosts/opencode/beat.node-test.ts hosts/opencode/room.node-test.ts \
   hosts/opencode/launcher.node-test.ts hosts/opencode/server.node-test.ts hosts/opencode/macula.node-test.ts \
-  hosts/opencode/lifecycle.node-test.ts
+  hosts/opencode/lifecycle.node-test.ts hosts/opencode/receipts.node-test.ts
 ```
 
 `lifecycle.node-test.ts` is the #24 headless lifecycle test: it starts a throwaway member in a real tmux session
 through `bin/crew`, counts its agent and macula-mcp children with `crew ls`, stops it by process group (a bystander
 process proves nothing else is killed) and restarts it. It needs `tmux` and `bash` on PATH and skips with that reason
-otherwise.
+otherwise. `receipts.node-test.ts` is the #24b live proof of the delivery receipt (a real Claude member, a real mesh,
+a real macula-mcp publishing one room message): it is opt-in, `CREW_LIVE_RECEIPTS=1`, so CI and every ordinary run
+skip it.
 
 `macula.node-test.ts` is the #23 integration test: it runs a real `opencode` through a location boot, a second
 directory and a reload, and asserts exactly one stub macula server per member and that a room message arriving after
@@ -107,6 +109,13 @@ counts an OpenCode member live only while an `opencode` process with its `CREW_N
 
 ## What does not map (yet)
 
+- **Delivery receipts (#24b).** A receiving Claude host publishes a `message_delivered` fact on the room after a
+  delivery; the OpenCode plugin cannot: its plugin API exposes no way to call an MCP tool (`MCPDomain` is
+  `list`/`transform`/`reload` in v2.0.24 through v2.0.26), so an OpenCode member's host stays silent and the
+  supervisor shows `no receipt (host cannot publish yet)` for it. The note is in crew-code#24; a second short-lived
+  macula-mcp just to publish was rejected (it would re-create the #23 station-link flap). The plugin also does not
+  list its own sent instructions yet (`crew_receipts` is Claude-side), for the same reason it cannot see its own
+  `mesh_say` calls.
 - **Waiting on a reply.** The Claude mod sees its own `mesh_say` calls; the OpenCode plugin does not yet, so an
   OpenCode member that asked a question shows idle, not waiting.
 - **waiting.** OpenCode reports no background work or scheduled wake-up at the end of a turn, so a member with work in
