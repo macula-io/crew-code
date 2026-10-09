@@ -1,6 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
+import { acceptEnvelope, fenceDelivery, nameOf, roomRulesPrompt, waitingOn, type Refusal, type RoomMessage, type Roster, type Waiting } from '../core/crew_room.ts'
 import type { CrewBackground, CrewBeat, CrewGoal, CrewGoalView, CrewPending, CrewProgress, CrewRefreshFlow, CrewState, CrewTask, CrewWeekly } from '../types'
 
 const PANE = 'crew'
@@ -53,6 +54,7 @@ const WAKE_AFTER_MS = 2 * 60_000
 const WAKE_MAX_MS = 30 * 60_000
 const BOARD_EMPTY_MS = 30 * 60_000
 const MESH_CALL = 'mcp__macula__mesh_call'
+const MESH_SAY = 'mcp__macula__mesh_say'
 const CLAIMS = ['mcl-kanban/claim_next_card', 'mcl-kanban/claim_card']
 const wakes = atom({ plugin: 'crew', key: 'wakes' } as const, 0)
 const wokenAt = atom({ plugin: 'crew', key: 'wokenAt' } as const, 0)
@@ -84,6 +86,91 @@ const askBoard = async ($: EngineInterface, procedure: string, args: Record<stri
   const reply = JSON.parse(text) as { result?: Record<string, unknown> }
   const failed = reply.result?.error
   return failed === undefined ? { result: reply.result ?? {} } : { error: `${procedure}: ${JSON.stringify(failed)}` }
+}
+
+// The crew room (#18): one mesh room per crew, its topic in room.json (the Supervisor opens it), the crew's node
+// ids in roster.json (bin/crew writes it). Watched every ROOM_POLL_MS through the macula server, no model turn:
+// a message is delivered only by core/crew_room.ts's rules (attested, from the roster, addressed here).
+const ROOM_POLL_MS = 10_000
+type CrewRoom = { topic: string; me: string; roster: Roster; waiting: Waiting; dropped: number }
+const NO_ROOM: CrewRoom = { topic: '', me: '', roster: {}, waiting: {}, dropped: 0 }
+const crewRoom = atom({ plugin: 'crew', key: 'room' } as const, NO_ROOM)
+
+// One macula MCP tool: its JSON answer, or why it failed.
+const askMesh = async ($: EngineInterface, tool: string, args: Record<string, unknown>) => {
+  const answer = await $.mcp.call(MESH_SERVER, tool, args).catch((error: unknown) => ({
+    content: [{ type: 'text', text: String(error) }],
+    isError: true,
+  }))
+  const text = textOf(answer.content)
+  if (answer.isError) return { error: text || `${tool} failed` }
+  try {
+    return { result: JSON.parse(text) as Record<string, unknown> }
+  } catch {
+    return { error: `${tool}: ${text.slice(0, 120)}` }
+  }
+}
+
+const readJsonFile = async ($: EngineInterface, path: string) =>
+  (await $.fs.exists(path)) ? (JSON.parse(await $.fs.read(path)) as Record<string, unknown>) : null
+
+// Joins the crew room, opening it first when this is the Supervisor and there is none. No room.json and not
+// the Supervisor: no channel (the prompt says so once).
+const joinCrewRoom = async ($: EngineInterface) => {
+  const dir = await crewDir($)
+  const roster = ((await readJsonFile($, `${dir}/roster.json`).catch(() => null)) ?? {}) as Roster
+  const name = await currentName($)
+  const me = roster[name] ?? ''
+  let topic = String((await readJsonFile($, `${dir}/room.json`).catch(() => null))?.topic ?? '')
+  if (!topic && name === SUPERVISOR && me) {
+    const opened = await askMesh($, 'mesh_open_room', { purpose: 'crew room', public: 0 })
+    topic = String(opened.result?.room_topic ?? '')
+    if (topic) await $.fs.write(`${dir}/room.json`, JSON.stringify({ topic, opened_by: me, at: await $.clock.now() }))
+  }
+  if (!topic || !me) return update($, crewRoom, room => ({ ...room, topic: '', me, roster }))
+  await askMesh($, 'mesh_join_room', { room_topic: topic })
+  return update($, crewRoom, room => ({ ...room, topic, me, roster }))
+}
+
+const boundary = () => Array.from({ length: 16 }, () => Math.floor(Math.random() * 16).toString(16)).join('')
+
+// One read of the crew room after this session's cursor. The first read only sets the cursor: a fresh
+// session does not replay the room's history.
+const watchCrewRoom = async ($: EngineInterface) => {
+  const room = await read($, crewRoom)
+  if (!room.topic || !room.me) return
+  const key = `room-seq:${await $.session.id()}`
+  const held = await $.store.get(key)
+  const cursor = typeof held === 'number' ? held : undefined
+  const asked = await askMesh($, 'mesh_read_inbox', cursor === undefined ? { room_topic: room.topic, limit: 1 } : { room_topic: room.topic, after_seq: cursor, limit: 200 })
+  const page = (asked.result?.rooms as { room_topic: string; messages?: RoomMessage[]; next_after_seq?: number }[] | undefined)?.find(r => r.room_topic === room.topic)
+  if (!page) return
+  if (typeof page.next_after_seq === 'number') await $.store.set(key, page.next_after_seq)
+  if (cursor === undefined) return
+  let { waiting, dropped } = room
+  for (const message of page.messages ?? []) {
+    const accepted = acceptEnvelope(message, { me: room.me, roster: room.roster, supervisor: SUPERVISOR })
+    if (!accepted.deliver) {
+      if (accepted.reason !== 'own') dropped += 1
+      continue
+    }
+    waiting = waitingOn(waiting, { type: 'received', inReplyTo: message.in_reply_to })
+    await $.prompt.submit({ text: fenceDelivery(message, accepted, { boundary: boundary(), owner: OWNER, supervisor: SUPERVISOR }) })
+  }
+  const answered = Object.keys(waiting).length < Object.keys(room.waiting).length
+  await update($, crewRoom, held => ({ ...held, waiting, dropped }))
+  const beat = await read($, me)
+  if (answered && beat?.state === 'waiting') return settle($, beat.lastLine)
+  if (dropped !== room.dropped) await writeBeat($, {})
+}
+
+// A mesh_say this session sent that expects a reply: it waits on the recipients until one names it.
+const noteSent = async ($: EngineInterface, ran: { result?: unknown }) => {
+  const sent = (JSON.parse(textOf(((ran.result ?? {}) as { content?: { type: string; text?: string }[] }).content ?? [])) as { sent?: { message_id?: string; kind?: string; to?: string[] } }).sent
+  if (!sent?.message_id || !sent.kind) return
+  const room = await read($, crewRoom)
+  const to = (sent.to ?? []).map(id => nameOf(room.roster, id) ?? id.slice(0, 8))
+  await update($, crewRoom, held => ({ ...held, waiting: waitingOn(held.waiting, { type: 'sent', kind: sent.kind ?? '', messageId: sent.message_id ?? '', to }) }))
 }
 
 const goalOf = (result: Record<string, unknown>): CrewGoal | null => {
@@ -666,6 +753,7 @@ const waitingOnOf = async ($: EngineInterface) => {
     ...inFlight.background.map(task => task.label),
     ...(inFlight.wakeups > 0 ? [inFlight.wakeups === 1 ? 'a scheduled wake-up' : `${inFlight.wakeups} scheduled wake-ups`] : []),
     ...(progress && progress.step < progress.of ? [`${progress.task} (${progress.step}/${progress.of})`] : []),
+    ...[...new Set(Object.values((await read($, crewRoom)).waiting))].map(who => `reply from ${who}`),
   ]
 
   return parts.join(', ')
@@ -764,6 +852,7 @@ const writeBeat = async ($: EngineInterface, change: Partial<CrewBeat>) => {
     fiveHourPercent: usage.rateLimits.find(limit => limit.kind === 'five_hour')?.percentUsed ?? null,
     weekly: weeklyOf(usage.rateLimits),
     modelWhy: await modelWhyOf($, change.name ?? name),
+    roomDropped: (await read($, crewRoom)).dropped,
     startedAt: usage.startedAt,
     beatAt: await $.clock.now(),
   }
@@ -964,8 +1053,10 @@ export const register: Register = (on, options) => {
     $.clock.every(IDLE_CHECK_MS, () => void refreshWhenIdle($))
     $.clock.every(IDLE_CHECK_MS, () => void wakeWhenIdle($))
     $.clock.every(GOAL_MS, () => void loadGoal($))
+    $.clock.every(ROOM_POLL_MS, () => void watchCrewRoom($).catch(() => undefined))
     await loadBeats($)
     void loadGoal($)
+    await joinCrewRoom($).catch(() => undefined)
 
     return next(e)
   })
@@ -1234,11 +1325,25 @@ export const register: Register = (on, options) => {
       { id: 'crew:models', text: modelPrompt(isSupervisor), scope: 'session' as const },
     ]
 
-    return { ...composed, sections: [...composed.sections, ...board, ...progress, ...refresh, ...briefs, ...asks, ...budget, ...ledger] }
+    const room = await read($, crewRoom)
+    const roomText = room.topic
+      ? roomRulesPrompt({ topic: room.topic, roster: room.roster, supervisor: SUPERVISOR, owner: OWNER })
+      : `Crew room: none for this session (no room.json from the ${SUPERVISOR}, or this member is not in roster.json, which bin/crew writes).`
+    const crewRoomSection = [{ id: 'crew:room', text: roomText, scope: 'session' as const }]
+
+    return { ...composed, sections: [...composed.sections, ...board, ...progress, ...refresh, ...briefs, ...asks, ...budget, ...ledger, ...crewRoomSection] }
   })
 
   // The board is the card boundary: a claim at or above the claim limit is refused and turns
   // into a handover, a claimed card resets the wake backoff, and a finished card is logged.
+  // A question or a handed-over task in the crew room: this session waits on the reply (#18).
+  on('tool.call', { tool: MESH_SAY }, async ($, e, next) => {
+    const ran = await next(e)
+    if (ran.deny === undefined && ran.isError !== true) await noteSent($, ran).catch(() => undefined)
+
+    return ran
+  })
+
   on('tool.call', { tool: MESH_CALL }, async ($, e, next) => {
     const call = e as unknown as { procedure?: unknown; args?: { card_id?: unknown } }
     const procedure = procedureOf(call)
@@ -1536,6 +1641,7 @@ export const register: Register = (on, options) => {
                 {beat.repo}
                 {beat.model ? <Text dimColor>{` · ${beat.model.replace(/^claude-/, '')}`}</Text> : null}
                 {beat.modelWhy ? <Text color="cyan">{` ${beat.modelWhy}`}</Text> : null}
+                {beat.roomDropped ? <Text color="yellow">{` · room: ${beat.roomDropped} dropped`}</Text> : null}
               </Text>
               {beat.progress && !isOff && (() => {
                 const { task, step, of } = beat.progress

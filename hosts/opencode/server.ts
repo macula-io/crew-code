@@ -9,14 +9,17 @@
 // Loaded by bin/crew through OPENCODE_CONFIG_CONTENT ({"plugins": ["file://.../hosts/opencode"]}): OpenCode 2
 // loads a plugin directory's `server` entry, this file.
 import { execFileSync } from 'node:child_process'
-import { appendFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname } from 'node:path'
 
-import { LOG_EVENTS, PACKAGE_REF, apply, beatOf, fresh, isoWeek, ledgerLine, parkPath, type Member, type Tracker, type Usage } from './beat.ts'
+import { acceptEnvelope, fenceDelivery, roomRulesPrompt, type Roster } from '../../core/crew_room.ts'
+import { rowToMessage, type TranscriptRow } from './room.ts'
+import { LOG_EVENTS, PACKAGE_REF, apply, beatOf, fresh, isoWeek, ledgerLine, offline, parkPath, type Member, type Tracker, type Usage } from './beat.ts'
 
 const BEAT_MS = 20_000
-const CREW_DIR = `${process.env.HOME || homedir()}/.claude/crew`
+// CREW_DIR overrides where beats, the roster and the room live (tests and proofs; the crew uses the default).
+const CREW_DIR = process.env.CREW_DIR || `${process.env.HOME || homedir()}/.claude/crew`
 const NAME = process.env.CREW_NAME?.trim() || ''
 const OWNER = process.env.CREW_OWNER?.trim() || 'the owner'
 const SUPERVISOR = process.env.CREW_SUPERVISOR?.trim() || 'Supervisor'
@@ -32,10 +35,27 @@ type Ctx = {
   event: { subscribe: () => AsyncIterable<{ type: string; data?: Record<string, unknown> }> }
   session: {
     get: (input: { sessionID: string }) => Promise<Record<string, unknown>>
+    prompt: (input: { sessionID: string; text: string; delivery?: 'steer' | 'queue' }) => Promise<unknown>
+    hook: (name: 'context', run: (event: { sessionID: string; system: { type: 'text'; text: string }[] }) => void) => Promise<unknown>
   }
   model?: { list?: () => Promise<unknown> }
   tool: { transform: (edit: (tools: { add: (tool: Record<string, unknown>) => void }) => void) => Promise<unknown> }
 }
+
+const ROOM_POLL_MS = 10_000
+// The transcript every macula-mcp process on this machine writes; the crew room's messages are in it as long as
+// any crew session's macula server is in the room.
+const TRANSCRIPT = process.env.MACULA_MCP_LOBBY_TRANSCRIPT_DB || `${process.env.HOME || homedir()}/.macula-mcp/lobby-transcript.sqlite3`
+
+const readJson = (path: string) => {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
+  } catch {
+    return null
+  }
+}
+
+const boundary = () => Array.from({ length: 16 }, () => Math.floor(Math.random() * 16).toString(16)).join('')
 
 const write = (path: string, text: string) => {
   mkdirSync(dirname(path), { recursive: true })
@@ -104,13 +124,32 @@ const start = async (ctx: Ctx) => {
     // The member session tools act on: the one that ran last.
     let current = ''
 
+    // Each member session's last beat, for the offline beat written on exit.
+    const lastBeats = new Map<string, Record<string, unknown>>()
     const beat = async (member: Member) => {
       if (limits.size === 0) limits = await limitsOf(ctx)
       const usage = await usageOf(ctx, member, limits)
       const at = { name: NAME, repo, isParked: isParked(), now: Date.now(), startedAt: usage.startedAt, usage }
-      write(`${CREW_DIR}/${member.sessionId}.json`, JSON.stringify(beatOf(member, at)))
+      const written = { ...beatOf(member, at), roomDropped }
+      lastBeats.set(member.sessionId, written)
+      write(`${CREW_DIR}/${member.sessionId}.json`, JSON.stringify(written))
       trace(`beat ${member.sessionId} ${member.state}`)
     }
+    // On exit (/exit, or the plugin unloaded) every member session's beat goes offline at once, written
+    // synchronously because nothing async runs after 'exit'; signals stay OpenCode's (Ctrl+C interrupts a turn).
+    // A process killed outright writes nothing: bin/crew's is_live also checks the process. Last usage kept.
+    const goOffline = () => {
+      for (const member of Object.values(tracker.sessions)) {
+        const held = lastBeats.get(member.sessionId)
+        if (!held) continue
+        try {
+          writeFileSync(`${CREW_DIR}/${member.sessionId}.json`, JSON.stringify({ ...held, state: offline(member).state, beatAt: Date.now() }))
+        } catch {
+          // The crew directory is gone: nothing to mark.
+        }
+      }
+    }
+    process.once('exit', goOffline)
     const beatAll = () => Promise.all(Object.values(tracker.sessions).map(beat)).catch(() => undefined)
     // OpenCode publishes no session.created for a session that existed before this plugin subscribed
     // (opencode run creates its session first), so a session first seen mid-stream is looked up once:
@@ -135,6 +174,64 @@ const start = async (ctx: Ctx) => {
     }
 
     const timer = setInterval(() => void beatAll(), BEAT_MS)
+
+    // The crew room (#18): delivered by core/crew_room.ts's rules, read from the shared transcript by row id.
+    const roster = (readJson(`${CREW_DIR}/roster.json`) ?? {}) as Roster
+    const myId = roster[NAME] ?? ''
+    const topic = String(readJson(`${CREW_DIR}/room.json`)?.topic ?? '')
+    let roomCursor = -1
+    let roomDropped = 0
+    // bun:sqlite, as OpenCode runs plugins under Bun; read-only, and opened per read so a missing file is no error.
+    const roomRows = async (afterId: number): Promise<TranscriptRow[]> => {
+      if (!existsSync(TRANSCRIPT)) return []
+      const { Database } = await import('bun:sqlite')
+      const db = new Database(TRANSCRIPT, { readonly: true })
+      try {
+        return db.query('SELECT id, raw_json, publisher FROM observed_facts WHERE topic = ? AND id > ? ORDER BY id LIMIT 200').all(topic, afterId) as TranscriptRow[]
+      } finally {
+        db.close()
+      }
+    }
+    const watchRoom = async () => {
+      if (!topic || !myId) return
+      if (roomCursor < 0) {
+        // A fresh session does not replay the room's history.
+        const { Database } = await import('bun:sqlite')
+        if (!existsSync(TRANSCRIPT)) return
+        const db = new Database(TRANSCRIPT, { readonly: true })
+        try {
+          roomCursor = Number((db.query('SELECT COALESCE(MAX(id), 0) AS n FROM observed_facts WHERE topic = ?').get(topic) as { n: number }).n)
+        } finally {
+          db.close()
+        }
+        return
+      }
+      // No member session yet: nothing to deliver to, so the cursor waits too.
+      if (!current) return
+      const rows = await roomRows(roomCursor)
+      if (rows.length > 0) trace(`room read after ${roomCursor}: ${rows.map(row => row.id).join(',')}`)
+      for (const row of rows) {
+        roomCursor = row.id
+        const message = rowToMessage(row)
+        if (!message) continue
+        const accepted = acceptEnvelope(message, { me: myId, roster, supervisor: SUPERVISOR })
+        if (!accepted.deliver) {
+          if (accepted.reason !== 'own') roomDropped += 1
+          continue
+        }
+        trace(`room delivers ${message.message_id} from ${accepted.sender}`)
+        await ctx.session.prompt({ sessionID: current, text: fenceDelivery(message, accepted, { boundary: boundary(), owner: OWNER, supervisor: SUPERVISOR }), delivery: 'queue' })
+      }
+      if (roomDropped > 0) trace(`room dropped ${roomDropped}`)
+    }
+    const roomTimer = setInterval(() => void watchRoom().catch(error => trace(`room watch failed: ${String(error)}`)), ROOM_POLL_MS)
+    void watchRoom().catch(() => undefined)
+    const rules = topic && myId
+      ? roomRulesPrompt({ topic, roster, supervisor: SUPERVISOR, owner: OWNER })
+      : 'Crew room: none for this session (no room.json from the Supervisor, or this member is not in roster.json, which bin/crew writes).'
+    await ctx.session.hook('context', event => {
+      if (!tracker.children[event.sessionID]) event.system.push({ type: 'text', text: rules })
+    }).catch(error => trace(`room rules not added: ${String(error)}`))
     const stream = (async () => {
       for await (const event of ctx.event.subscribe()) await feed(event)
     })().catch(error => trace(`event stream ended: ${String(error)}`))
@@ -240,7 +337,8 @@ const start = async (ctx: Ctx) => {
 
     return async () => {
       clearInterval(timer)
-      await beatAll()
+      clearInterval(roomTimer)
+      goOffline()
       void stream
     }
 }

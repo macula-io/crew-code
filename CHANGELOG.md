@@ -3,6 +3,10 @@
 ## Unreleased
 
 ### Added
+- The crew room (#18): one mesh room for the whole crew, on every host. The Supervisor opens it (`room.json`), every session joins it, and `crew` writes the members' node ids (`roster.json`, `crew roster`). A message addressed to a session becomes a turn in it, fenced as a crew member's words; only one attested from a roster node id and addressed to that session gets through, the rest is dropped and counted on the row (`room: N dropped`). Only the Supervisor's node id may relay the owner's decision. A member waiting on a reply shows `waiting on reply from <name>`. Rules in `core/crew_room.ts`, shared by the Claude mod and the OpenCode plugin (which reads the shared macula-mcp transcript). Needs macula-mcp 0.46.1. Fable gated the design.
+
+### Fixed
+- An OpenCode member that exited stayed live for up to ten minutes, so `crew <Name>` refused to relaunch it: the plugin now writes an offline beat on exit, and `crew` counts an OpenCode member live only while its `opencode` process runs.
 - OpenCode members, a prototype (#11 step 3): `CREW_AGENT=opencode crew <Name>` starts a member on OpenCode 2 with the `hosts/opencode` plugin, which writes the same dashboard beat (working, reviewing, needs-you, idle, with model, cost and the row's line) and offers `report_progress`, `crew_park`, `crew_log` and `queue_ask`. Not mapped yet: waiting, `crew_refresh`, the board rules in the member's instructions. See `hosts/opencode/README.md`.
 - The crew plugin: dashboard (`/crew`), progress bars (`report_progress`), the kanban board loop, a 50% claim limit and a 70% handover limit, handovers and refresh (`/crew-refresh auto | package [all] | on | off | now`), wake-on-idle, the crew goal (`/crew-goal`).
 - Package mode: a member keeps its context across the cards of one work package and hands over when the board gives it a card from another, only above 20% context.

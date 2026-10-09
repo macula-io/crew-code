@@ -168,6 +168,10 @@ export const apply = (tracker: Tracker, event: BusEvent): Tracker => {
   }
 }
 
+// A member session as its process ends: offline at once, so the launcher and the dashboard do not take a
+// member that exited for a live one until its beat ages out.
+export const offline = (m: Member): Member => ({ ...m, state: 'offline', reviewers: [], openAsks: {} })
+
 export type Usage = { model: string; costUsd: number | null; contextPercent: number | null }
 
 // The beat the dashboard reads, unchanged in shape; `agent` says which coding agent wrote it.

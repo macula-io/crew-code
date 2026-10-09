@@ -49,8 +49,24 @@ writing the same files: the beat, `asks/*.json`, `ledger/<ISO week>/<session>.js
 `~/.claude/crew/opencode/park-<Name>`, shown in the beat's `isParked`. Each beat also says `"agent": "opencode"`,
 which the launcher reads to resume the right agent; the dashboard ignores it.
 
+## The crew room
+
+The plugin cannot call MCP tools, so it reads the crew room from the transcript every macula-mcp process on the machine
+writes (`~/.macula-mcp/lobby-transcript.sqlite3`, read-only, by row id), judges each message with the same rules as the
+Claude mod (`core/crew_room.ts`: attested by the station's publisher, sender on the roster, addressed to this member),
+and delivers it into the member's session as a queued prompt (`session.prompt`, `delivery: "queue"`). The room rules go
+into the system prompt through the session `context` hook. It works while some macula-mcp process on the machine is in
+the room, which every crew session is. Checked live against OpenCode 2.0.24: an addressed message from a roster member
+became a turn, a forged one and a stranger's were dropped.
+
+On exit (or when the plugin is unloaded) every member session's beat is written offline at once, so a member that was
+closed can be relaunched right away. A process killed outright writes nothing; `bin/crew` therefore counts an OpenCode
+member live only while an `opencode` process with its `CREW_NAME` runs.
+
 ## What does not map (yet)
 
+- **Waiting on a reply.** The Claude mod sees its own `mesh_say` calls; the OpenCode plugin does not yet, so an
+  OpenCode member that asked a question shows idle, not waiting.
 - **waiting.** OpenCode reports no background work or scheduled wake-up at the end of a turn, so a member with work in
   hand shows idle.
 - **crew_refresh.** A plugin cannot clear a session and restart it from a handover.

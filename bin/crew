@@ -7,6 +7,7 @@
 #                              --fresh); --tab opens it in a new kitty tab instead
 #   crew rename <Old> <New>    move key, role card and offline beats to a new name
 #   crew ls                    roster, liveness and the session a resume would open
+#   crew roster                write ~/.claude/crew/roster.json: every member's mesh node id (done before every launch)
 #
 # Each session runs claude with CREW_NAME=<Name>, MACULA_MCP_AGENT=<name> and -n <Name>.
 # Each session runs on its model: CREW_MODEL if set, else the member's own entry in the crew plugin's
@@ -91,11 +92,26 @@ boot_time() { awk '/^btime /{ print $2 }' /proc/stat; }
 # Live = a recent, non-offline beat written since this boot. A beat from before a
 # reboot is stale whatever its age: no process survived to write it.
 is_live() {
-    local beat state at
+    local beat sid state at
     beat="$(last_beat "$1")"
     [[ -n "${beat}" ]] || return 1
-    read -r _ state at <<<"${beat}"
-    [[ "${state}" != offline ]] && ((at >= $(boot_time))) && (($(date +%s) - at < LIVE_WINDOW_S))
+    read -r sid state at <<<"${beat}"
+    [[ "${state}" != offline ]] && ((at >= $(boot_time))) && (($(date +%s) - at < LIVE_WINDOW_S)) || return 1
+    # An OpenCode member that exited without its offline beat (killed, crashed) leaves a fresh one behind:
+    # it is live only while an opencode process with its CREW_NAME runs.
+    [[ "$(beat_agent "${sid}")" != opencode ]] || opencode_running "$1"
+}
+
+# Whether an opencode process started for this member (CREW_NAME=<name> in its environment) still runs.
+opencode_running() {
+    local environ cmd
+    for environ in /proc/[0-9]*/environ; do
+        [[ -r "${environ}" ]] || continue
+        { tr '\0' '\n' <"${environ}"; } 2>/dev/null | grep -qx "CREW_NAME=$1" || continue
+        cmd="$({ tr '\0' ' ' <"${environ%/environ}/cmdline"; } 2>/dev/null)"
+        [[ "${cmd}" == *opencode* ]] && return 0
+    done
+    return 1
 }
 
 transcript_of() {
@@ -356,12 +372,54 @@ rename() {
 
 usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
+# The macula-mcp release that prints a key's node id (macula-mcp-node-id), and the crew room needs (#18).
+MACULA_MCP_PKG="${CREW_MACULA_MCP:-@macula-io/mcp@0.46.1}"
+
+# The node id one member's mesh server uses: the key key_of finds (a member started before named keys keeps its
+# old file), else its named key, created now as its server would.
+node_id_of() {
+    local key lname
+    key="$(key_of "$1")"
+    lname="$(lower "$1")"
+    if [[ -n "${key}" ]]; then
+        env -u MACULA_MCP_AGENT "MACULA_MCP_IDENTITY=${KEYS}/${key}" npx -y -p "${MACULA_MCP_PKG}" macula-mcp-node-id
+    else
+        env -u MACULA_MCP_IDENTITY "MACULA_MCP_AGENT=${lname}" npx -y -p "${MACULA_MCP_PKG}" macula-mcp-node-id
+    fi
+}
+
+# roster.json: name -> node id for every member, the crew room's only trust anchor (#18). A session delivers a
+# room message only from a node id listed here. Written whole, owner-only, then renamed into place.
+write_roster() {
+    local name id ids=()
+    while read -r name; do
+        id="$(node_id_of "${name}" 2>/dev/null | tr -d '[:space:]')" || id=""
+        [[ "${id}" =~ ^[0-9a-f]{64}$ ]] || { echo "crew: no node id for ${name}; left out of the roster" >&2; continue; }
+        ids+=("${name}" "${id}")
+    done < <(roster)
+    if [[ -n "${CREW_DRY_RUN:-}" ]]; then
+        printf 'roster: %s\n' "${ids[*]}"
+        return 0
+    fi
+    mkdir -p "${BEATS}"
+    local tmp
+    tmp="$(mktemp "${BEATS}/roster.json.XXXX")"
+    chmod 600 "${tmp}"
+    if ! printf '%s\n' "${ids[@]}" | jq -R . | jq -s '. as $a | reduce range(0; length; 2) as $i ({}; . + {($a[$i]): $a[$i + 1]})' >"${tmp}"; then
+        rm -f "${tmp}"
+        die "could not write the roster"
+    fi
+    mv "${tmp}" "${BEATS}/roster.json"
+    echo "roster: $(( ${#ids[@]} / 2 )) members in ${BEATS}/roster.json"
+}
+
 main() {
     [[ $# -ge 1 ]] || usage 1
     local mode=resume
     case "$1" in
         -h | --help | help) usage 0 ;;
         ls) list ;;
+        roster) write_roster ;;
         rename)
             [[ $# -eq 3 ]] || die "usage: crew rename <Old> <New>"
             rename "$2" "$3"
@@ -369,6 +427,7 @@ main() {
         up)
             [[ "${2:-}" == --fresh ]] && mode=fresh
             check_kitty
+            write_roster
             while read -r name; do bring_up "${name}" "${mode}" tab; done < <(roster)
             ;;
         -*) die "unknown option '$1'" ;;
@@ -383,6 +442,7 @@ main() {
                 esac
             done
             [[ "${where}" == tab ]] && check_kitty
+            write_roster
             bring_up "${name}" "${mode}" "${where}"
             ;;
     esac

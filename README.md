@@ -84,6 +84,21 @@ Every session appends to `~/.claude/crew/ledger/<ISO week>/<session>.jsonl`, one
 - **Budget**: the account's weekly window as the sessions read it (percent used, when it resets), a run-out projected at the week's pace so far, shown in red when it comes before the reset, and the Fable gauge the owner sets with `/crew-budget fable <percent>`. The supervisor's prompt carries the same line as a measurement for the owner: the crew's pace changes only when the owner says so.
 - **Refresh**: a running refresh shows its phase (due, handing over, clearing), and for half an hour after one the row shows the drop, e.g. `refreshed 53% → 4%`. A handover a member writes on its own is not a refresh and shows nothing.
 
+## The crew room
+
+The crew talks in one mesh room, on every host. The Supervisor's session opens it (topic in
+`~/.claude/crew/room.json`) and every session joins it at start; `crew` writes `~/.claude/crew/roster.json`, each
+member's mesh node id, before every launch (`crew roster` writes it alone). A message addressed to a session (`to`, by
+node id) becomes a turn in it, like a cross-session message, so a reply wakes the one who asked. A member that asks a
+question or hands over a task shows `waiting on reply from <name>` until the reply comes.
+
+The room is a mesh topic anyone who learns it can read and post on, and a delivered message becomes a prompt. So a
+message is delivered only when the station attests its sender, that sender's node id is on the roster, and it is
+addressed to this session; everything else is dropped and counted on the dashboard row (`room: 3 dropped`). The text is
+fenced as a crew member's words. Only a message from the Supervisor's node id may relay the owner's decision, and
+only with the exact sha range. Never put secrets or private detail in a crew message: the room is not encrypted. The
+rules live in `core/crew_room.ts`, shared by every host; it needs macula-mcp 0.46.1 or later in every member.
+
 ## Assignments survive a refresh
 
 A refresh clears the member's chat, so its assignment lives outside it: the card it holds on the board, and the supervisor's brief file `~/.claude/sessions/BRIEF_<YYYY-MM-DD>_<Name>.md` (the supervisor's prompt tells it to write one with each assignment). The resume prompt points the fresh session at both, as well as at its handover.
@@ -124,7 +139,7 @@ When `board` is `mesh` and there is no board for this member (nothing serves `mc
 ```
 claude plugin validate .
 claude plugin test .
-node --test hosts/opencode/beat.node-test.ts    # the OpenCode adapter
+node --test hosts/opencode/*.node-test.ts    # the OpenCode adapter and the launcher
 ```
 
 Load a working copy with `claude --plugin-dir <this folder>`, or list it in `CLAUDE_CODE_PLUGIN_DIRS`.
