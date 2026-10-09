@@ -4,7 +4,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { apply, beatOf, fresh, isoWeek, ledgerLine, parkPath, type Tracker } from './beat.ts'
+import { apply, beatOf, fresh, isoWeek, ledgerLine, offline, parkPath, type Tracker } from './beat.ts'
 
 const ROOT = 'ses_root'
 const CHILD = 'ses_child'
@@ -143,4 +143,11 @@ test('ledger lines and park files use the Claude mod\'s paths and shapes', () =>
   assert.deepEqual(JSON.parse(ledgerLine({ event: 'checkpoint', package: 'macula-io/crew-code#11', note: 'go' }, 'Pluto', 7, 0.5)), {
     event: 'checkpoint', package: 'macula-io/crew-code#11', note: 'go', name: 'Pluto', at: 7, cost: 0.5, weekly: null,
   })
+})
+
+test('on shutdown every member session goes offline at once, its line kept', () => {
+  const started = run([ev('session.created', { sessionID: ROOT }), ev('session.execution.started', { sessionID: ROOT }), ev('session.text.ended', { sessionID: ROOT, text: 'bye' })])
+  const gone = offline(started.sessions[ROOT]!)
+  assert.equal(gone.state, 'offline')
+  assert.equal(gone.lastLine, 'bye')
 })
