@@ -192,7 +192,18 @@ const start = async (ctx: Ctx) => {
         db.close()
       }
     }
+    // One read at a time: a slow read or prompt must not let the next poll read from the same cursor (#19).
+    let watchingRoom = false
     const watchRoom = async () => {
+      if (watchingRoom) return
+      watchingRoom = true
+      try {
+        await readRoom()
+      } finally {
+        watchingRoom = false
+      }
+    }
+    const readRoom = async () => {
       if (!topic || !myId) return
       if (roomCursor < 0) {
         // A fresh session does not replay the room's history.

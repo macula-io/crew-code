@@ -21,7 +21,7 @@ const text = (value: unknown) => ({ value: { content: [{ type: 'text', text: JSO
 // A session named `name`, with roster.json and (optionally) room.json in the crew directory, and a mesh whose
 // mesh_read_inbox answers come from `inbox` in turn.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const roomSession = (on: any, name: string, opts: { hasRoom: boolean; inbox: unknown[] }) => {
+const roomSession = (on: any, name: string, opts: { hasRoom: boolean; inbox: unknown[]; submitWaits?: Promise<void> }) => {
   const store = new Map<string, unknown>([['name:id-crew', name]])
   const files = new Map<string, string>([[`${CREW}/roster.json`, ROSTER]])
   if (opts.hasRoom) files.set(`${CREW}/room.json`, JSON.stringify({ topic: TOPIC, opened_by: SUP, at: 1 }))
@@ -45,7 +45,7 @@ const roomSession = (on: any, name: string, opts: { hasRoom: boolean; inbox: unk
   on('store.get', (_$: unknown, e: { key: string }) => ({ value: store.get(e.key) }))
   on('store.set', (_$: unknown, e: { key: string; value: unknown }) => { store.set(e.key, e.value); return { value: undefined } })
   on('store.delete', (_$: unknown, e: { key: string }) => { store.delete(e.key); return { value: undefined } })
-  on('prompt.submit', (_$: unknown, e: { text: string }) => { prompts.push(e.text); return { text: e.text } })
+  on('prompt.submit', async (_$: unknown, e: { text: string }) => { prompts.push(e.text); await opts.submitWaits; return { text: e.text } })
   on('command.register', (_$: unknown, e: { name: string }) => ({ value: { command: e.name } }) as never)
   on('tool.register', (_$: unknown, e: { name: string }) => ({ value: { tool: `mcp__crew__${e.name}` } }) as never)
   on('session.start', () => ({ cwd: '/w' }) as never)
@@ -55,7 +55,13 @@ const roomSession = (on: any, name: string, opts: { hasRoom: boolean; inbox: unk
     calls.push({ tool: e.tool, args: e.args })
     if (e.tool === 'mesh_open_room') return text({ room_topic: TOPIC })
     if (e.tool === 'mesh_join_room') return text({ room_topic: TOPIC, already_joined: 0 })
-    if (e.tool === 'mesh_read_inbox') return text(opts.inbox.shift() ?? { rooms: [{ room_topic: TOPIC, messages: [], next_after_seq: Number(e.args.after_seq ?? 0) }] })
+    if (e.tool === 'mesh_read_inbox') {
+      // As the server does: with after_seq, only messages recorded after it.
+      const next = (opts.inbox.shift() ?? { rooms: [{ room_topic: TOPIC, messages: [], next_after_seq: Number(e.args.after_seq ?? 0) }] }) as { rooms: { messages: { seq?: number }[] }[] }
+      const after = e.args.after_seq
+      if (typeof after === 'number') next.rooms = next.rooms.map(r => ({ ...r, messages: r.messages.filter(m => typeof m.seq !== 'number' || m.seq > after) }))
+      return text(next)
+    }
     return text({ result: {} })
   })
   return { store, files, prompts, calls }
@@ -130,6 +136,23 @@ test('the cursor survives: the next read starts after the last message seen', as
   await clock.advance(10_000)
   expect(s.calls.filter(c => c.tool === 'mesh_read_inbox').map(c => c.args.after_seq).slice(0, 3)).toEqual([undefined, 5, 6])
   expect(s.store.get('room-seq:id-crew')).toBe(6)
+})
+
+// crew-code#19: a busy session takes long to accept a submitted turn. Polls that run meanwhile must not deliver the
+// same message again: it became ~27 turns in the Supervisor on 2026-10-09.
+test('a message is delivered once, even when the session is busy and later polls run before the turn is accepted', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  let release = () => {}
+  const submitWaits = new Promise<void>(resolve => { release = resolve })
+  const once = msg({ seq: 6 })
+  const s = roomSession(on, 'Pluto', { hasRoom: true, submitWaits, inbox: [page([], 5), page([once], 6), page([once], 6), page([once], 6)] })
+  await $.session.start({ source: 'startup', cwd: '/w' } as never)
+  void clock.advance(10_000)
+  await clock.advance(10_000)
+  await clock.advance(10_000)
+  release()
+  await clock.advance(10_000)
+  expect(s.prompts.filter(p => p.includes('Crew room message')).length).toBe(1)
 })
 
 test('after asking Venus a question the row waits on her reply, until a reply names the question', async ($, on) => {

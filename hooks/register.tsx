@@ -136,8 +136,20 @@ const boundary = () => Array.from({ length: 16 }, () => Math.floor(Math.random()
 
 // One read of the crew room after this session's cursor. The first read, right after the join, only sets the
 // cursor: a fresh session does not replay the room's history, and misses nothing that arrives after it joined.
-// The cursor moves past each message as it is handled, so a failed delivery loses none of the rest.
+// The cursor moves past each message before it is submitted, and only one read runs at a time: a busy session
+// accepts a submitted turn late, and a poll meanwhile must not deliver the same message again (#19).
+let watchingCrewRoom = false
 const watchCrewRoom = async ($: EngineInterface) => {
+  if (watchingCrewRoom) return
+  watchingCrewRoom = true
+  try {
+    await readCrewRoom($)
+  } finally {
+    watchingCrewRoom = false
+  }
+}
+
+const readCrewRoom = async ($: EngineInterface) => {
   const room = await read($, crewRoom)
   if (!room.topic || !room.me) return
   const key = `room-seq:${await $.session.id()}`
@@ -153,11 +165,11 @@ const watchCrewRoom = async ($: EngineInterface) => {
   let { waiting, dropped } = room
   for (const message of page.messages ?? []) {
     const accepted = acceptEnvelope(message, { me: room.me, roster: room.roster, supervisor: SUPERVISOR })
+    if (typeof message.seq === 'number') await $.store.set(key, message.seq)
     if (accepted.deliver) {
       waiting = waitingOn(waiting, { type: 'received', inReplyTo: message.in_reply_to })
       await $.prompt.submit({ text: fenceDelivery(message, accepted, { boundary: boundary(), owner: OWNER, supervisor: SUPERVISOR }) })
     } else if (accepted.reason !== 'own') dropped += 1
-    if (typeof message.seq === 'number') await $.store.set(key, message.seq)
   }
   if (typeof page.next_after_seq === 'number') await $.store.set(key, page.next_after_seq)
   const answered = Object.keys(waiting).length < Object.keys(room.waiting).length
