@@ -109,6 +109,11 @@ counts an OpenCode member live only while an `opencode` process with its `CREW_N
 
 ## What does not map (yet)
 
+- **Session tabs at relaunch.** The OpenCode TUI restores its own tab list from its client state, so a superseded
+  session can still appear as an in-app tab until the client closes it; a server-side plugin has no tab control. What
+  the plugin does own (#24 follow-up): a session the store no longer has is never adopted again (a stale tab's late
+  event cannot revive it), its beat file is reaped within one beat, and beats for gone sessions are reaped at setup,
+  so superseded sessions leave no ghost dashboard rows.
 - **Delivery receipts (#24b).** A receiving Claude host publishes a `message_delivered` fact on the room after a
   delivery; the OpenCode plugin cannot: its plugin API exposes no way to call an MCP tool (`MCPDomain` is
   `list`/`transform`/`reload` in v2.0.24 through v2.0.26), so an OpenCode member's host stays silent and the

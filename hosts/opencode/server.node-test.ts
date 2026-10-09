@@ -323,3 +323,46 @@ test('crew_restart runs the launcher with the member and reports it (#24)', asyn
   const bad = await tool.execute({ name: 'not a name', reason: 'x', fresh: 0 }, { sessionID: SID })
   assert.match(String(bad.content), /Not restarted/)
 })
+
+// #24 follow-up, found live: a superseded session deleted from the store kept a beat ticking, because a
+// late event from its stale TUI tab re-adopted it (session.get fails, and the old adopt still created the
+// member), and the 20s beat loop never asked whether the session still existed.
+test('a session the store no longer has is not adopted, so no ghost beat (#24 follow-up)', async (t) => {
+  const dir = crewDirWith()
+  const ctx = fakeCtx([])
+  // One late event for a session the store no longer has, as a stale tab emits: the subscription ends
+  // with it, so only the plugin's own work is under test.
+  ctx.event.subscribe = () => (async function* () {
+    yield { type: 'session.text.ended', data: { sessionID: 'ses_gone000000000000000000000', text: 'ghost' } }
+  })()
+  const teardown = await start(ctx, options(dir, memorySource()))
+  t.after(async () => { await teardown?.() })
+
+  await new Promise(resolve => setTimeout(resolve, 200))
+  assert.equal(existsSync(join(dir, 'ses_gone000000000000000000000.json')), false, 'no beat for a session the store does not have')
+})
+
+test('a beat is reaped within a beat when its session is gone, and not rewritten (#24 follow-up)', async (t) => {
+  const dir = crewDirWith()
+  let alive = true
+  const ctx = fakeCtx([])
+  ctx.session.get = async ({ sessionID }: { sessionID: string }) => {
+    if (!alive || sessionID !== SID) throw new Error('Session.NotFoundError')
+    return { id: SID }
+  }
+  const teardown = await start(ctx, options(dir, memorySource()))
+  t.after(async () => { await teardown?.() })
+  await until(() => existsSync(join(dir, `${SID}.json`)), 3000)
+  alive = false
+  await until(() => !existsSync(join(dir, `${SID}.json`)), 3000)
+  await new Promise(resolve => setTimeout(resolve, 1200))
+  assert.equal(existsSync(join(dir, `${SID}.json`)), false, 'and it is not rewritten')
+})
+
+test('a beat whose session is gone is reaped at setup (#24 follow-up)', async (t) => {
+  const dir = crewDirWith()
+  writeFileSync(join(dir, 'ses_gone000000000000000000000.json'), JSON.stringify({ sessionId: 'ses_gone000000000000000000000', name: 'Probe', state: 'idle', agent: 'opencode', beatAt: Date.now() - 1000 }))
+  const teardown = await start(fakeCtx([]), options(dir, memorySource()))
+  t.after(async () => { await teardown?.() })
+  await until(() => !existsSync(join(dir, 'ses_gone000000000000000000000.json')), 3000)
+})

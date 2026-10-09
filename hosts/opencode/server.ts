@@ -266,20 +266,40 @@ export const start = async (ctx: Ctx, options: StartOptions = {}) => {
       writeFileSync(`${crewDir}/${member.sessionId}.json`, JSON.stringify({ ...held, state: offline(member).state, beatAt: Date.now() }))
     }
   })
-  const beatAll = () => Promise.all(Object.values(tracker.sessions).map(beat)).catch(() => undefined)
+  const beatAll = async () => {
+    // A beat lives only while its session does (#24 follow-up): a session deleted from the store (out of
+    // band, or by a stale tab's late event) is dropped with its beat file, so no ghost row keeps ticking.
+    for (const member of Object.values(tracker.sessions)) {
+      const info = await ctx.session.get({ sessionID: member.sessionId }).catch(() => null)
+      if (info) {
+        await beat(member).catch(() => undefined)
+        continue
+      }
+      tracker = apply(tracker, { type: 'session.deleted', data: { sessionID: member.sessionId } })
+      lastBeats.delete(member.sessionId)
+      if (current === member.sessionId) current = ''
+      rmSync(`${crewDir}/${member.sessionId}.json`, { force: true })
+      trace(`session ${member.sessionId} is gone; beat reaped`)
+    }
+  }
   // OpenCode publishes no session.created for a session that existed before this plugin subscribed
   // (opencode run creates its session first), so a session first seen mid-stream is looked up once:
-  // its parentID says whether it is a member's session or a subagent's.
+  // its parentID says whether it is a member's session or a subagent's. A session the store does not
+  // have is never adopted: a stale tab's late event must not revive a ghost beat (#24 follow-up).
   const adopt = async (sessionID: string) => {
     if (!sessionID || tracker.sessions[sessionID] || tracker.children[sessionID]) return
-    const info = await ctx.session.get({ sessionID }).catch(() => ({}) as Record<string, unknown>)
+    const info = await ctx.session.get({ sessionID }).catch(() => null)
+    if (!info) {
+      trace(`adopt skipped ${sessionID}: not in the store`)
+      return
+    }
     tracker = apply(tracker, { type: 'session.created', data: { sessionID, parentID: info.parentID, agent: info.agent, title: info.title } })
   }
   // A reloaded plugin has no session.created and no storage listing to lean on, so it adopts the member
   // session the crew's own beat names (#22): the newest beat for this member on this host, confirmed with
   // session.get to be a root (no parentID). With no such beat the member is brand new and `current` waits.
   const adoptExisting = async () => {
-    let newest: { sessionID: string; beatAt: number } | null = null
+    let newest: { sessionID: string; beatAt: number; info: Record<string, unknown> } | null = null
     let entries: string[] = []
     try {
       entries = readdirSync(crewDir)
@@ -292,13 +312,19 @@ export const start = async (ctx: Ctx, options: StartOptions = {}) => {
       if (!held || held.agent !== 'opencode' || held.name !== name) continue
       const sessionID = String(held.sessionId ?? entry.replace(/\.json$/, ''))
       if (!sessionID) continue
+      // A superseded session deleted from the store left a beat behind: reap it here, so it neither
+      // ticks nor draws a ghost row on the dashboard (#24 follow-up).
+      const info = await ctx.session.get({ sessionID }).catch(() => null)
+      if (!info) {
+        rmSync(`${crewDir}/${entry}`, { force: true })
+        trace(`reaped beat for gone session ${sessionID}`)
+        continue
+      }
       const beatAt = Number(held.beatAt) || 0
-      if (!newest || beatAt > newest.beatAt) newest = { sessionID, beatAt }
+      if (!info.parentID && (!newest || beatAt > newest.beatAt)) newest = { sessionID, beatAt, info }
     }
     if (!newest) return
-    const info = await ctx.session.get({ sessionID: newest.sessionID }).catch(() => null)
-    if (!info || info.parentID) return
-    tracker = apply(tracker, { type: 'session.created', data: { sessionID: newest.sessionID, parentID: info.parentID, agent: info.agent, title: info.title } })
+    tracker = apply(tracker, { type: 'session.created', data: { sessionID: newest.sessionID, parentID: newest.info.parentID, agent: newest.info.agent, title: newest.info.title } })
     current = newest.sessionID
     const member = tracker.sessions[newest.sessionID]
     if (member) await beat(member).catch(error => trace(`adopt beat failed: ${String(error)}`))
