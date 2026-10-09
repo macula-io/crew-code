@@ -1130,3 +1130,70 @@ test('every member is told to call crew_refresh when told to refresh, not to wri
   const composed = await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: [], tools: [], outputStyle: null, traits: [] } as never)
   expect(composed.sections.some((section: { text: string }) => section.text.includes('crew_refresh'))).toBe(true)
 })
+
+// crew-code#13: one menu per change, routine asks queued and offered together, the queue on the dashboard.
+const ASKS_DIR = '/home/test/.claude/crew/asks'
+const queueAsk = (ask: string) => ({ tool: 'mcp__crew__queue_ask', ask }) as never
+
+test('queue_ask holds a routine ask for the owner and says how many wait', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Mars']])
+  mock.clock(on, { now: NOW })
+  const { files } = crewSession(on, store, { percent: 30 })
+
+  await $.tool.call(queueAsk('Delete merged branch neptunus/49-roll1 in macula-station?'))
+  const ran = await $.tool.call(queueAsk('Remove worktree neptunus-13?'))
+
+  const queued = [...files.entries()].filter(([path]) => path.startsWith(`${ASKS_DIR}/`)).map(([, text]) => JSON.parse(text))
+  expect(queued.map(ask => ask.ask)).toEqual(['Delete merged branch neptunus/49-roll1 in macula-station?', 'Remove worktree neptunus-13?'])
+  expect(queued.every(ask => ask.from === 'Mars')).toBe(true)
+  expect(String((ran as { result?: unknown }).result)).toContain('2 asks waiting')
+})
+
+test('take_asks hands over every queued ask, oldest first, and empties the queue', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Supervisor']])
+  mock.clock(on, { now: NOW })
+  const { files } = crewSession(on, store, { percent: 30 })
+  const removed: string[] = []
+  files.set(`${ASKS_DIR}/2000-b.json`, JSON.stringify({ from: 'Venus', ask: 'Delete branch venus/x?', at: 2000 }))
+  files.set(`${ASKS_DIR}/1000-a.json`, JSON.stringify({ from: 'Mars', ask: 'Remove worktree mars-y?', at: 1000 }))
+  on('process.run', (_$: unknown, e: { argv: string[] }) => {
+    if (e.argv[0] === 'rm') e.argv.slice(2).forEach(path => { removed.push(path); files.delete(path) })
+    return { value: { exitCode: 0, stdout: '2026-10-06\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+
+  const ran = String(((await $.tool.call({ tool: 'mcp__crew__take_asks' } as never)) as { result?: unknown }).result)
+
+  expect(ran.indexOf('Mars: Remove worktree mars-y?')).toBeLessThan(ran.indexOf('Venus: Delete branch venus/x?'))
+  expect(ran).toContain('multiSelect')
+  expect(removed.sort()).toEqual([`${ASKS_DIR}/1000-a.json`, `${ASKS_DIR}/2000-b.json`])
+})
+
+test('the dashboard header says how many asks wait for the owner', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.env(on, { HOME: '/home/test' })
+  const rows = { 'mars.json': beat('Mars', 'working', NOW - 1_000) }
+  const asks = ['1-a.json', '2-b.json', '3-c.json']
+  on('fs.exists', () => ({ value: true }))
+  on('fs.list', (_$: unknown, e: { path: string }) => ({
+    value: (e.path.endsWith('/asks') ? asks : Object.keys(rows)).map(name => ({ name, kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })),
+  }))
+  on('fs.read', (_$: unknown, e: { path: string }) => ({ value: rows[e.path.split('/').at(-1) as 'mars.json'] ?? '' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+
+  await $.command.run({ command: 'crew', args: '' } as never)
+  const ui = await paneOf($)
+  expect(await ui.find({ text: /3 asks waiting/ })).toBeDefined()
+})
+
+test('every session is told: one menu per change, routine asks to queue_ask; the Supervisor offers them with take_asks', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Supervisor']])
+  mock.clock(on, { now: NOW })
+  crewSession(on, store, { percent: 30 })
+  on('prompt.compose', () => ({ sections: [] }) as never)
+
+  const composed = await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: [], tools: [], outputStyle: null, traits: [] } as never)
+  const text = composed.sections.map((section: { text: string }) => section.text).join('\n')
+  expect(text).toContain('one menu per change')
+  expect(text).toContain('queue_ask')
+  expect(text).toContain('take_asks')
+})
