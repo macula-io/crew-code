@@ -10,8 +10,14 @@ room and server parts in `room.ts` and `server.ts`, with tests:
 
 ```sh
 node --experimental-strip-types --test hosts/opencode/beat.node-test.ts hosts/opencode/room.node-test.ts \
-  hosts/opencode/launcher.node-test.ts hosts/opencode/server.node-test.ts hosts/opencode/macula.node-test.ts
+  hosts/opencode/launcher.node-test.ts hosts/opencode/server.node-test.ts hosts/opencode/macula.node-test.ts \
+  hosts/opencode/lifecycle.node-test.ts
 ```
+
+`lifecycle.node-test.ts` is the #24 headless lifecycle test: it starts a throwaway member in a real tmux session
+through `bin/crew`, counts its agent and macula-mcp children with `crew ls`, stops it by process group (a bystander
+process proves nothing else is killed) and restarts it. It needs `tmux` and `bash` on PATH and skips with that reason
+otherwise.
 
 `macula.node-test.ts` is the #23 integration test: it runs a real `opencode` through a location boot, a second
 directory and a reload, and asserts exactly one stub macula server per member and that a room message arriving after
@@ -66,8 +72,9 @@ The row's line is the last line of the member's last answer (`session.text.ended
 `session.get`. Context share is the last step's tokens (`session.step.ended`) over the model's window from
 `ctx.model.list()`.
 
-Tools: `report_progress` (with `phase`), `crew_park`, `crew_log` and `queue_ask`, with the Claude mod's descriptions,
-writing the same files: the beat, `asks/*.json`, `ledger/<ISO week>/<session>.jsonl`. The park flag is a file,
+Tools: `report_progress` (with `phase`), `crew_park`, `crew_log`, `queue_ask` and `crew_restart` (the supervisor restarts a
+member headless through the launcher: stop by process group, start in a detached tmux session; `fresh` 1 drops the old
+context), with the Claude mod's descriptions, writing the same files: the beat, `asks/*.json`, `ledger/<ISO week>/<session>.jsonl`. The park flag is a file,
 `~/.claude/crew/opencode/park-<Name>`, shown in the beat's `isParked`. Each beat also says `"agent": "opencode"`,
 which the launcher reads to resume the right agent; the dashboard ignores it.
 

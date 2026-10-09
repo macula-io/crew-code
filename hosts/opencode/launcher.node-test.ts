@@ -5,9 +5,19 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+
+// A dry run goes through write_roster, which would run `npx macula-mcp-node-id` and download the package
+// into each scratch HOME (about 130 MB per run: leftover scratch homes had filled /tmp). A failing npx
+// on PATH keeps these tests offline and tiny; the node ids are skipped, with a warning, as they are
+// when npx cannot reach npm (#24).
+const stubBin = mkdtempSync(join(tmpdir(), 'crew-test-bin-'))
+writeFileSync(join(stubBin, 'npx'), '#!/bin/bash\nexit 1\n')
+chmodSync(join(stubBin, 'npx'), 0o755)
+process.on('exit', () => { try { rmSync(stubBin, { recursive: true, force: true }) } catch {} })
+process.env.PATH = `${stubBin}:${process.env.PATH}`
 
 const CREW = join(import.meta.dirname, '..', '..', 'bin', 'crew')
 

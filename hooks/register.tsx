@@ -235,6 +235,10 @@ const PARK_TOOL = 'mcp__crew__crew_park'
 // A member told to refresh calls crew_refresh: the forced flow of /crew-refresh now, whatever its mode,
 // which stays as it was. A handover a member writes on its own is invisible here and clears nothing.
 const REFRESH_TOOL = 'mcp__crew__crew_refresh'
+// The Supervisor restarts members headless through the launcher (#24): stop by process group, start in
+// a detached tmux session. CREW_BIN is the launcher's own path, put there by the launch env; a `crew`
+// on PATH works too. Owner approval is for pushes, tags and fleet changes, never a member restart.
+const RESTART_TOOL = 'mcp__crew__crew_restart'
 // Routine asks for the owner wait in a queue, one file per ask under the crew directory (so sessions
 // never race on one file), until the Supervisor offers them together in one multi-select menu.
 const QUEUE_TOOL = 'mcp__crew__queue_ask'
@@ -499,6 +503,10 @@ const refreshRulePrompt = () =>
   `Crew refresh: when the ${SUPERVISOR} or ${OWNER} tells you to refresh, call crew_refresh with the reason and end your turn; ` +
   'the crew mod then asks you for your handover, clears this session and resumes it. Never write a handover on your own instead: ' +
   'the mod does not see it and nothing is cleared.'
+
+const restartRulePrompt = () =>
+  `Crew restarts: when a member is stalled, or a fix needs a relaunch, call crew_restart (name, reason, fresh 0/1); it stops the member's own ` +
+  `process group and starts it headless again, no kitty and no ${OWNER} needed. Use fresh 1 only when the member asks for it or its state is broken.`
 
 const asksRulePrompt = () =>
   `Crew asks: one menu per change. Put everything one change needs from ${OWNER} (the code range, the tag, the fleet commit, ` +
@@ -1047,6 +1055,21 @@ export const register: Register = (on, options) => {
       },
     })
     await $.tool.register({
+      name: 'crew_restart',
+      description:
+        'Restart a crew member headless: stop it cleanly (its own process group) and start it again in a detached tmux session, no kitty needed. ' +
+        `For the ${SUPERVISOR}: use it when a member is stalled or a fix needs a relaunch. ${OWNER}'s approval is needed for pushes, tags and fleet changes, not for member restarts.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'The member to restart' },
+          reason: { type: 'string', description: 'Why, in one line' },
+          fresh: { type: 'integer', enum: [0, 1], description: '1 starts a fresh session (drops its context), 0 resumes the last one' },
+        },
+        required: ['name', 'reason', 'fresh'],
+      },
+    })
+    await $.tool.register({
       name: 'queue_ask',
       description:
         `Queue a routine yes/no ask for ${OWNER} instead of opening a menu for it: a cleanup, a branch or worktree to delete. ` +
@@ -1353,6 +1376,7 @@ export const register: Register = (on, options) => {
     const refresh = [{ id: 'crew:refresh', text: refreshRulePrompt(), scope: 'session' as const }]
     const isSupervisor = (await currentName($)) === SUPERVISOR
     const briefs = isSupervisor ? [{ id: 'crew:briefs', text: briefRulePrompt(), scope: 'session' as const }] : []
+    const restarts = isSupervisor ? [{ id: 'crew:restarts', text: restartRulePrompt(), scope: 'session' as const }] : []
     const line = isSupervisor ? budgetLine(weeklyOf((await $.session.usage()).rateLimits), await fableOf($), await $.clock.now()) : ''
     const budget = line
       ? [{
@@ -1378,7 +1402,7 @@ export const register: Register = (on, options) => {
       : `Crew room: none for this session (no room.json from the ${SUPERVISOR}, or this member is not in roster.json, which bin/crew writes).`
     const crewRoomSection = [{ id: 'crew:room', text: roomText, scope: 'session' as const }]
 
-    return { ...composed, sections: [...composed.sections, ...board, ...progress, ...refresh, ...briefs, ...asks, ...budget, ...ledger, ...crewRoomSection] }
+    return { ...composed, sections: [...composed.sections, ...board, ...progress, ...refresh, ...briefs, ...restarts, ...asks, ...budget, ...ledger, ...crewRoomSection] }
   })
 
   // The board is the card boundary: a claim at or above the claim limit is refused and turns
@@ -1551,6 +1575,26 @@ export const register: Register = (on, options) => {
         `Refresh requested (${reason}). End your turn now: the crew mod then asks you for your handover, clears this session ` +
         'and resumes it from the handover. Your refresh mode is unchanged.',
     }
+  })
+
+  on('tool.call', { tool: RESTART_TOOL }, async ($, e) => {
+    const input = e as unknown as { name?: unknown; reason?: unknown; fresh?: unknown }
+    const name = String(input.name ?? '').trim()
+    const reason = String(input.reason ?? '').trim().slice(0, 160)
+    if (!/^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$/.test(name)) {
+      return { result: 'Not restarted: name must be a plain member name (letters, digits, _ and -).' }
+    }
+    const fresh = Number(input.fresh) === 1
+    const bin = (await $.env.get('CREW_BIN')) || 'crew'
+    const ran = await $.process.run([bin, 'restart', name, ...(fresh ? ['--fresh'] : [])]).catch(() => null)
+    if (!ran) return { result: `Not restarted: could not run ${bin} (set CREW_BIN, or put crew on PATH).` }
+    if (ran.exitCode !== 0) {
+      const why = ran.stderr.trim().split('\n').filter(Boolean).at(-1) ?? `exit ${ran.exitCode}`
+      return { result: `Not restarted: ${why}` }
+    }
+    const tail = ran.stdout.trim().split('\n').filter(Boolean).at(-1) ?? ''
+
+    return { result: `${name} restarted${fresh ? ' fresh' : ''} (${reason}).${tail ? ` ${tail}` : ''}` }
   })
 
   on('tool.call', { tool: 'TaskCreate' }, async ($, e, next) => {

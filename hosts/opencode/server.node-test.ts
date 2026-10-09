@@ -20,7 +20,7 @@
 // Run: node --experimental-strip-types --test hosts/opencode/server.node-test.ts
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -292,4 +292,34 @@ test('two overlapping instances of one location deliver the room row once (#19)'
   await new Promise(resolve => setTimeout(resolve, 100))
   assert.equal(prompts.length, 1, 'one row is one turn')
   assert.equal(existsSync(join(dir, 'opencode', 'delivered', 'Probe', '0'.repeat(31) + '2')), true, 'the claim is on disk')
+})
+
+// crew-code#24 (a): the Supervisor restarts members headless. The tool runs `crew restart <name>
+// [--fresh]` through the launcher its own launch env names (CREW_BIN) and reports what it said.
+test('crew_restart runs the launcher with the member and reports it (#24)', async (t) => {
+  const dir = crewDirWith()
+  const ctx = fakeCtx([])
+  const teardown = await start(ctx, options(dir, memorySource()))
+  t.after(async () => { await teardown?.() })
+  const tool = ctx.tools['crew_restart']
+  assert.ok(tool, 'crew_restart is registered')
+
+  // A stub launcher records the argv it was handed.
+  const marker = join(dir, 'restart-args.txt')
+  const stub = join(dir, 'fake-crew.sh')
+  writeFileSync(stub, `#!/bin/bash\nprintf '%s\\n' "$@" > "${marker}"\necho "Probe: stopped"\necho "Probe: started headless in tmux session crew-probe"\n`)
+  chmodSync(stub, 0o755)
+  const previous = process.env.CREW_BIN
+  process.env.CREW_BIN = stub
+  t.after(() => {
+    if (previous === undefined) delete process.env.CREW_BIN
+    else process.env.CREW_BIN = previous
+  })
+
+  const result = await tool.execute({ name: 'Venus', reason: 'stalled', fresh: 1 }, { sessionID: SID })
+  assert.match(String(result.content), /Venus restarted fresh/)
+  assert.match(String(result.content), /started headless/)
+  assert.deepEqual(readFileSync(marker, 'utf8').trim().split('\n'), ['restart', 'Venus', '--fresh'])
+  const bad = await tool.execute({ name: 'not a name', reason: 'x', fresh: 0 }, { sessionID: SID })
+  assert.match(String(bad.content), /Not restarted/)
 })

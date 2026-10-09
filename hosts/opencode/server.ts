@@ -511,6 +511,40 @@ export const start = async (ctx: Ctx, options: StartOptions = {}) => {
         return { content: `Queued for ${owner}. Do not ask it now; carry on.` }
       },
     })
+    tools.add({
+      name: 'crew_restart',
+      options: { codemode: false },
+      description:
+        'Restart a crew member headless: stop it cleanly (its own process group) and start it again in a detached tmux session, no kitty needed. ' +
+        `For the ${supervisor}: use it when a member is stalled or a fix needs a relaunch. ${owner}'s approval is needed for pushes, tags and fleet changes, not for member restarts.`,
+      input: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'The member to restart' },
+          reason: { type: 'string', description: 'Why, in one line' },
+          fresh: { type: 'integer', enum: [0, 1], description: '1 starts a fresh session (drops its context), 0 resumes the last one' },
+        },
+        required: ['name', 'reason', 'fresh'],
+      },
+      execute: async (input: { name?: unknown; reason?: unknown; fresh?: unknown }) => {
+        const member = String(input.name ?? '').trim()
+        if (!/^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$/.test(member)) {
+          return { content: 'Not restarted: name must be a plain member name (letters, digits, _ and -).' }
+        }
+        const fresh = Number(input.fresh) === 1
+        // The launcher's own path comes in on the launch env; a checkout's sibling bin/crew covers a
+        // session started by hand.
+        const launcher = process.env.CREW_BIN?.trim() || resolve(import.meta.dirname ?? '.', '..', '..', 'bin', 'crew')
+        try {
+          const out = execFileSync(launcher, ['restart', member, ...(fresh ? ['--fresh'] : [])], { encoding: 'utf8', timeout: 120_000 })
+          const tail = out.trim().split('\n').filter(Boolean).at(-1) ?? ''
+          return { content: `${member} restarted${fresh ? ' fresh' : ''}.${tail ? ` ${tail}` : ''}` }
+        } catch (error) {
+          const stderr = String((error as { stderr?: string }).stderr ?? '').trim().split('\n').filter(Boolean).at(-1)
+          return { content: `Not restarted: ${stderr || (error instanceof Error ? error.message : String(error))}` }
+        }
+      },
+    })
   })
 
   return async () => {

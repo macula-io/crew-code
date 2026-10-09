@@ -1685,3 +1685,60 @@ test('the pane draws every beat, skips files that are not beats, and defaults mi
   expect(await ui.find({ text: /Venus/ })).toBeDefined()
   expect(await ui.find({ text: /Terra/ })).toBeDefined()
 })
+
+// crew-code#24 (a): the Supervisor restarts a member headless through the launcher. The launcher's
+// own path rides the session's launch env (CREW_BIN); `crew` on PATH is the fallback. The tool reports
+// what the launcher said, and refuses a name that is not a plain member name.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const restartMocks = (on: any, runs: string[][], reply?: { exitCode: number; stderr: string }) => {
+  mock.env(on, { HOME: '/home/test' })
+  on('fs.exists', () => ({ value: false }))
+  on('fs.write', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('session.id', () => ({ value: 'id-mercurius' }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000, percent: 10 }, rateLimits: [] } }))
+  on('session.repo', () => ({ value: null }))
+  on('session.cwd', () => ({ value: '/w' }))
+  on('session.root', () => ({ value: '/w' }))
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('session.turns', () => ({ value: 1 }))
+  on('session.messages', () => ({ value: [] }))
+  on('store.get', () => ({ value: undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('store.delete', () => ({ value: undefined }))
+  on('process.run', (_$: unknown, e: { argv: string[] }) => {
+    runs.push(e.argv)
+    return reply
+      ? { value: { exitCode: reply.exitCode, stdout: '', stderr: `${reply.stderr}\n`, isStdoutTruncated: false, isStderrTruncated: false } }
+      : { value: { exitCode: 0, stdout: 'Venus: stopped\nVenus: started headless in tmux session crew-venus\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+}
+
+test('crew_restart restarts a member through the launcher and reports it (#24)', async ($, on) => {
+  const runs: string[][] = []
+  mock.clock(on, { now: NOW })
+  restartMocks(on, runs)
+
+  const ran = await $.tool.call({ tool: 'mcp__crew__crew_restart', name: 'Venus', reason: 'stalled', fresh: 1 } as never)
+
+  expect(String(ran.text ?? ran.result)).toContain('Venus restarted fresh')
+  expect(String(ran.text ?? ran.result)).toContain('started headless')
+  expect(runs.at(-1)).toEqual(['crew', 'restart', 'Venus', '--fresh'])
+
+  const bad = await $.tool.call({ tool: 'mcp__crew__crew_restart', name: 'not a name', reason: 'x', fresh: 0 } as never)
+  expect(String(bad.text ?? bad.result)).toContain('Not restarted')
+  expect(runs).toHaveLength(1)
+})
+
+// A failing launcher is reported with its own last line, not swallowed.
+test('crew_restart reports what the launcher refused (#24)', async ($, on) => {
+  const runs: string[][] = []
+  mock.clock(on, { now: NOW })
+  restartMocks(on, runs, { exitCode: 1, stderr: 'crew: refusing to stop Venus: agent runs in process group 1, not its own' })
+
+  const ran = await $.tool.call({ tool: 'mcp__crew__crew_restart', name: 'Venus', reason: 'stalled', fresh: 0 } as never)
+
+  expect(String(ran.text ?? ran.result)).toContain('Not restarted')
+  expect(String(ran.text ?? ran.result)).toContain('refusing to stop')
+  expect(runs.at(-1)).toEqual(['crew', 'restart', 'Venus'])
+})

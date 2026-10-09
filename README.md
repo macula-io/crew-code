@@ -116,12 +116,19 @@ A refresh clears the member's chat, so its assignment lives outside it: the card
 
 ```
 crew up [--fresh]            every member not running, one kitty tab each
+crew start <Name> [--fresh]
+crew stop <Name>
+crew restart <Name> [--fresh]
 crew <Name> [--fresh] [--tab]
 crew rename <Old> <New>
 crew ls
 ```
 
-It needs kitty with `allow_remote_control yes`. Members are the `ROLE_<Name>.md` cards in `~/.claude/sessions`, plus the supervisor. Environment: `CREW_WORKDIR` (where sessions start, default `$HOME`), `CREW_SUPERVISOR`, `CREW_MODEL` (overrides `member_models` and `worker_model` for every session), `CREW_DRY_RUN=1` to print launches, `CREW_HOLD=1` to start sessions on hold (they read their card and handover, park themselves and wait to be told to resume).
+`crew up` and `crew <Name> --tab` need kitty with `allow_remote_control yes`; `crew start|stop|restart` work from any
+shell. A headless member runs in a detached tmux session the owner can attach to (`tmux attach -t crew-<name>`); `stop`
+kills exactly the member's own process group, and `ls` shows each member's live agent and macula-mcp process counts.
+The supervisor does the same through the `crew_restart` tool, so a stalled member or a fix that needs a relaunch no
+longer waits for the owner. Members are the `ROLE_<Name>.md` cards in `~/.claude/sessions`, plus the supervisor. Environment: `CREW_WORKDIR` (where sessions start, default `$HOME`), `CREW_SUPERVISOR`, `CREW_MODEL` (overrides `member_models` and `worker_model` for every session), `CREW_DRY_RUN=1` to print launches, `CREW_HOLD=1` to start sessions on hold (they read their card and handover, park themselves and wait to be told to resume).
 
 `CREW_AGENT=opencode crew <Name>` starts that member on OpenCode instead, on `CREW_OPENCODE_MODEL` (`provider/model`). It shows on the same dashboard; what maps and what does not is in [hosts/opencode/README.md](hosts/opencode/README.md) (a prototype).
 

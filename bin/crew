@@ -4,11 +4,17 @@
 #   crew up [--fresh] [Name...]
 #                              every member on the roster (or only the ones named) that is not
 #                              running, one kitty tab each
+#   crew start <Name> [--fresh]
+#                              one member headless: a detached tmux session, no kitty needed
+#                              (attach with tmux attach -t crew-<name>)
+#   crew stop <Name>           stop a member cleanly: its own process group only
+#   crew restart <Name> [--fresh]
+#                              stop the member if it runs, then start it headless
 #   crew <Name> [--fresh] [--tab]
 #                              one member in THIS terminal (resumes its last session unless
 #                              --fresh); --tab opens it in a new kitty tab instead
 #   crew rename <Old> <New>    move key, role card and offline beats to a new name
-#   crew ls                    roster, liveness and the session a resume would open
+#   crew ls                    roster, liveness, live agent/macula-mcp counts, and the session a resume would open
 #   crew roster                write ~/.claude/crew/roster.json: every member's mesh node id (done before every launch)
 #
 # Each session runs claude with CREW_NAME=<Name>, MACULA_MCP_AGENT=<name> and -n <Name>.
@@ -22,10 +28,15 @@
 # Set CREW_HOLD=1 to start sessions on hold: they read their card and handover, then wait.
 set -euo pipefail
 
+# This script's own path: the sessions it starts carry it as CREW_BIN, so the crew_restart tool
+# on both hosts restarts members through the same launcher (#24).
+SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 SESSIONS="${HOME}/.claude/sessions"
 BEATS="${HOME}/.claude/crew"
 PROJECTS="${HOME}/.claude/projects"
 KEYS="${HOME}/.config/macula-mcp/keys"
+# Where headless starts keep their run records (pid, process group, tmux session): what stop kills (#24).
+RUNS="${BEATS}/run"
 # Where member sessions start. Override with CREW_WORKDIR.
 WORKDIR="${CREW_WORKDIR:-${HOME}}"
 # Absolute, for launch and for the OpenCode plugin's own-location comparison (#23): a relative CREW_WORKDIR
@@ -127,16 +138,120 @@ is_live() {
     [[ "$(beat_agent "${sid}")" != opencode ]] || opencode_running "$1"
 }
 
+# The CREW_NAME from a process's NUL-separated environment, if it has one. Bash-native (mapfile), so a
+# long environment can never SIGPIPE a reader mid-scan.
+crew_name_of() {
+    local -a entries=()
+    mapfile -d '' -t entries <"$1" 2>/dev/null || true
+    local entry
+    for entry in "${entries[@]}"; do
+        [[ "${entry}" == CREW_NAME=* ]] && { printf '%s\n' "${entry#CREW_NAME=}"; return 0; }
+    done
+    return 1
+}
+
 # Whether an opencode process started for this member (CREW_NAME=<name> in its environment) still runs.
 opencode_running() {
-    local environ cmd
+    local environ name cmd
     for environ in /proc/[0-9]*/environ; do
-        [[ -r "${environ}" ]] || continue
-        { tr '\0' '\n' <"${environ}"; } 2>/dev/null | grep -qx "CREW_NAME=$1" || continue
+        name="$(crew_name_of "${environ}")" || continue
+        [[ "${name}" == "$1" ]] || continue
         cmd="$({ tr '\0' ' ' <"${environ%/environ}/cmdline"; } 2>/dev/null)"
         [[ "${cmd}" == *opencode* ]] && return 0
     done
     return 1
+}
+
+# Every crew process on this host, one line each: "<CREW_NAME> <pid> agent|macula". One pass over /proc,
+# keyed by the CREW_NAME the launcher puts in every member's environment; the kind comes from the
+# command line (a member's agent, or a macula-mcp server). The `npm exec` wrapper that fronts a
+# macula-mcp and OpenCode's `serve --stdio` child are not the process the owner counts, so they are
+# left out.
+all_processes() {
+    local environ pid name cmdline
+    for environ in /proc/[0-9]*/environ; do
+        [[ -r "${environ}" ]] || continue
+        name="$(crew_name_of "${environ}")" || continue
+        pid="${environ%/environ}"; pid="${pid##*/}"
+        cmdline="$({ tr '\0' ' ' <"/proc/${pid}/cmdline"; } 2>/dev/null)"
+        case "${cmdline}" in
+            *serve\ --stdio*) : ;;
+            *npm\ exec*macula-mcp* | *npm-cli.js*macula-mcp*) : ;;
+            *macula-mcp*) printf '%s %s macula\n' "${name}" "${pid}" ;;
+            *claude* | *opencode\ --standalone*) printf '%s %s agent\n' "${name}" "${pid}" ;;
+        esac
+    done
+}
+
+# The tmux session a headless member runs in, and the run record a headless start leaves behind.
+tmux_session() { printf 'crew-%s\n' "$(lower "$1")"; }
+run_file() { printf '%s/%s.json\n' "${RUNS}" "$1"; }
+
+# The pid of a member's agent process: the run record's pid when it is still that member's process,
+# else the first agent process whose CREW_NAME is the member. Identity, never an image or name pattern.
+agent_pid_of() {
+    local name="$1" record pid
+    record="$(run_file "${name}")"
+    if [[ -f "${record}" ]]; then
+        pid="$(jq -r '.pid // empty' "${record}" 2>/dev/null || true)"
+        if [[ -n "${pid}" && -r "/proc/${pid}/environ" ]] && [[ "$(crew_name_of "/proc/${pid}/environ")" == "${name}" ]]; then
+            printf '%s\n' "${pid}"
+            return 0
+        fi
+    fi
+    # awk reads every line (an early exit can SIGPIPE the scan under pipefail); the first match is
+    # taken below, in this shell.
+    local found
+    found="$(all_processes | awk -v n="${name}" '$1 == n && $3 == "agent" { print $2 }')"
+    printf '%s\n' "${found%%$'\n'*}"
+}
+
+# Whether a headless member's tmux session is up with a living agent in it.
+headless_running() {
+    tmux has-session -t "$(tmux_session "$1")" 2>/dev/null || return 1
+    [[ -n "$(agent_pid_of "$1")" ]]
+}
+
+# Stop <Name> cleanly (#24): its own process group only, never a signal by image or name pattern. The
+# record a headless start wrote names the pid; a member the owner started by hand (a kitty tab, this
+# terminal) is found by its CREW_NAME, and its group is only killed when the agent leads it -- the
+# launcher's exec chain makes the agent its own group and session leader everywhere it starts one.
+stop_member() {
+    local name="$1" record pid pgid session waited=0
+    valid_name "${name}" || die "'${name}' is not a plain name (letters, digits, _ and -)"
+    record="$(run_file "${name}")"
+    session="$(jq -r '.session // empty' "${record}" 2>/dev/null || true)"
+    pid="$(agent_pid_of "${name}")"
+    if [[ -z "${pid}" ]]; then
+        tmux kill-session -t "$(tmux_session "${name}")" 2>/dev/null || true
+        rm -f "${record}"
+        echo "${name}: not running"
+        return 0
+    fi
+    pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ')"
+    if [[ -z "${pgid}" || "${pgid}" == 1 || "${pgid}" == "$(ps -o pgid= -p $$ | tr -d ' ')" ]]; then
+        die "refusing to stop ${name}: agent pid ${pid} runs in process group ${pgid:-none}, not its own"
+    fi
+    echo "${name}: stopping process group ${pgid} (agent pid ${pid})"
+    kill -TERM -- "-${pgid}" 2>/dev/null || true
+    while [[ -d "/proc/${pid}" ]] && (( waited < 100 )); do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    if [[ -d "/proc/${pid}" ]]; then
+        echo "${name}: still up after 10s; SIGKILL"
+        kill -KILL -- "-${pgid}" 2>/dev/null || true
+        sleep 0.5
+    fi
+    [[ -n "${session}" ]] && tmux kill-session -t "${session}" 2>/dev/null || true
+    # A kitty tab the member ran in shows a dead process; close the one titled for it (its own, the
+    # launcher set that title) so a later start does not read the corpse as "already running".
+    command -v kitty >/dev/null 2>&1 && kitty @ close-window --match "title:^${name}$" >/dev/null 2>&1 || true
+    rm -f "${record}"
+    if [[ -d "/proc/${pid}" ]]; then
+        die "${name}: would not stop (agent pid ${pid} still runs)"
+    fi
+    echo "${name}: stopped"
 }
 
 transcript_of() {
@@ -193,42 +308,65 @@ beat_agent() {
     jq -r '.agent // "claude"' "${BEATS}/$1.json" 2>/dev/null || echo claude
 }
 
-# launch <tab|here> <Name> <cwd> <agent args...>: a new kitty tab, or exec in this terminal.
-launch() {
-    local where="$1" name="$2" cwd="$3"
-    shift 3
+# The argv a member's agent runs with: <Name>, then the agent's own arguments. Sets CMD. The
+# interactive shell matches how kitty launches members (no inherited secrets), and CREW_BIN lets the
+# crew_restart tool on either host restart members through this same launcher (#24).
+build_agent_cmd() {
+    local name="$1"
+    shift
     local agent model
     agent="$(lower "${name}")"
     model="$(model_for "${name}")"
-    # kitty @ launch runs the command in kitty's own environment, without what the
-    # user's rc files export (GH_TOKEN and other secrets). A hand-opened tab runs an
-    # interactive, non-login ${SHELL}; go through the same, then exec claude.
-    # That shell also exports ANTHROPIC_API_KEY, which would bill every session to
-    # the API key instead of the claude.ai login, so it is dropped here.
-    local cmd=("${SHELL:-/usr/bin/zsh}" -ic 'exec "$@"' crew
-        env -u MACULA_MCP_IDENTITY -u ANTHROPIC_API_KEY "CREW_NAME=${name}" "MACULA_MCP_AGENT=${agent}" claude --model "${model}" -n "${name}" "$@")
+    CMD=("${SHELL:-/usr/bin/zsh}" -ic 'exec "$@"' crew
+        env -u MACULA_MCP_IDENTITY -u ANTHROPIC_API_KEY "CREW_NAME=${name}" "CREW_BIN=${SELF}" "MACULA_MCP_AGENT=${agent}" claude --model "${model}" -n "${name}" "$@")
     if [[ "${AGENT}" == opencode ]]; then
         # --standalone: a private server, so the plugin runs in this member's process and reads its
         # CREW_NAME. The member's mesh server and its key go through the config (opencode_config);
         # CREW_WORKDIR tells the plugin which location is the member's own (#23).
-        cmd=("${SHELL:-/usr/bin/zsh}" -ic 'exec "$@"' crew
-            env -u MACULA_MCP_IDENTITY -u MACULA_MCP_AGENT -u ANTHROPIC_API_KEY "CREW_NAME=${name}" "CREW_SUPERVISOR=${SUPERVISOR}" "CREW_WORKDIR=${WORKDIR}"
+        CMD=("${SHELL:-/usr/bin/zsh}" -ic 'exec "$@"' crew
+            env -u MACULA_MCP_IDENTITY -u MACULA_MCP_AGENT -u ANTHROPIC_API_KEY "CREW_NAME=${name}" "CREW_SUPERVISOR=${SUPERVISOR}" "CREW_WORKDIR=${WORKDIR}" "CREW_BIN=${SELF}"
             "OPENCODE_CONFIG_CONTENT=$(opencode_config "${agent}" "$(opencode_model_for "${name}")")" opencode --standalone "$@")
     fi
+}
+
+# launch <tab|here|detached> <Name> <cwd> <agent args...>: a new kitty tab, exec in this terminal, or
+# a detached tmux session (#24) the owner can attach to.
+launch() {
+    local where="$1" name="$2" cwd="$3"
+    shift 3
+    build_agent_cmd "${name}" "$@"
     if [[ -n "${CREW_DRY_RUN:-}" ]]; then
         printf '[%s] cd %q &&' "${where}" "${cwd}"
-        printf ' %q' "${cmd[@]}"
+        printf ' %q' "${CMD[@]}"
         printf '\n'
         return 0
     fi
     if [[ "${where}" == here ]]; then
         cd "${cwd}"
-        exec "${cmd[@]}"
+        exec "${CMD[@]}"
+    fi
+    if [[ "${where}" == detached ]]; then
+        command -v tmux >/dev/null || die "tmux is not on PATH (a headless start needs it; --tab still opens a kitty tab)"
+        local session line pid pgid
+        session="$(tmux_session "${name}")"
+        # A session without a living agent is a corpse from a crash: replace it.
+        tmux kill-session -t "${session}" 2>/dev/null || true
+        line="$(printf '%q ' "${CMD[@]}")"
+        mkdir -p "${RUNS}"
+        tmux new-session -d -s "${session}" -c "${cwd}" -x 220 -y 60 "${line}"
+        pid="$(tmux list-panes -t "${session}" -F '#{pane_pid}' 2>/dev/null | head -1)"
+        [[ -n "${pid}" ]] || die "${name}: tmux started no pane"
+        pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ')"
+        jq -n --arg name "${name}" --argjson pid "${pid}" --argjson pgid "${pgid:-${pid}}" --arg session "${session}" \
+            --arg agent "${AGENT:-claude}" --argjson startedAt "$(date +%s)" \
+            '{name: $name, pid: $pid, pgid: $pgid, session: $session, agent: $agent, startedAt: $startedAt}' >"$(run_file "${name}")"
+        echo "${name}: started headless in tmux session ${session} (attach: tmux attach -t ${session})"
+        return 0
     fi
     # claude sets the terminal title over OSC, which kitty shows as the tab title
     # unless the tab has its own: pin both by the window id launch prints.
     local wid
-    wid="$(kitty @ launch --type=tab --cwd="${cwd}" --title="${name}" --tab-title="${name}" -- "${cmd[@]}")"
+    wid="$(kitty @ launch --type=tab --cwd="${cwd}" --title="${name}" --tab-title="${name}" -- "${CMD[@]}")"
     kitty @ set-window-title --match "id:${wid}" "${name}"
     kitty @ set-tab-title --match "window_id:${wid}" "${name}"
 }
@@ -247,7 +385,7 @@ check_kitty() {
 bring_up() {
     local name="$1" mode="$2" where="$3" beat sid transcript cwd
     valid_name "${name}" || die "'${name}' is not a plain name (letters, digits, _ and -)"
-    if is_live "${name}" || kitty_has_tab "${name}"; then
+    if is_live "${name}" || kitty_has_tab "${name}" || headless_running "${name}"; then
         echo "${name}: already running, left alone"
         return 0
     fi
@@ -295,17 +433,35 @@ bring_up_opencode() {
 }
 
 list() {
-    local name beat sid state at
-    printf '%-11s %-8s %-36s %s\n' NAME STATE "LAST SESSION" KEY
+    local name beat sid state at agents maculas
+    # One pass over /proc for every member's live process counts.
+    local -A AGENTS=() MACULAS=()
+    while read -r pname ppid pkind; do
+        case "${pkind}" in
+            agent) AGENTS["${pname}"]=$(( ${AGENTS["${pname}"]:-0} + 1 )) ;;
+            macula) MACULAS["${pname}"]=$(( ${MACULAS["${pname}"]:-0} + 1 )) ;;
+        esac
+    done < <(all_processes)
+    printf '%-11s %-8s %5s %-6s %-36s %s\n' NAME STATE AGENT MACULA "LAST SESSION" KEY
     while read -r name; do
         beat="$(last_beat "${name}")"
         sid=- state=never
         [[ -n "${beat}" ]] && read -r sid state at <<<"${beat}"
-        is_live "${name}" && state=live
-        [[ "${state}" == live ]] || [[ "${state}" == never ]] || state=offline
+        agents="${AGENTS["${name}"]:-0}"
+        maculas="${MACULAS["${name}"]:-0}"
+        if is_live "${name}"; then
+            state=live
+        elif (( agents > 0 )); then
+            # Processes but no fresh beat: up, off the dashboard.
+            state=running
+        elif [[ "${state}" == never ]]; then
+            state=never
+        else
+            state=offline
+        fi
         local key
         key="$(key_of "${name}")"
-        printf '%-11s %-8s %-36s %s\n' "${name}" "${state}" "${sid}" "${key:--}"
+        printf '%-11s %-8s %5s %-6s %-36s %s\n' "${name}" "${state}" "${agents}" "${maculas}" "${sid}" "${key:--}"
     done < <(roster)
 }
 
@@ -406,7 +562,7 @@ rename() {
     grep -rl -w "${old}" "${HOME}/.claude/projects/-home-rl-work-github-com/memory" 2>/dev/null | sed 's/^/    /' || true
 }
 
-usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # The macula-mcp release that prints a key's node id (macula-mcp-node-id), and the crew room needs (#18).
 MACULA_MCP_PKG="${CREW_MACULA_MCP:-@macula-io/mcp@0.46.1}"
@@ -470,6 +626,33 @@ main() {
             else
                 while read -r name; do bring_up "${name}" "${mode}" tab; done < <(roster)
             fi
+            ;;
+        start | stop | restart)
+            local cmd="$1" name opt have_fresh=0
+            shift
+            [[ $# -ge 1 ]] || die "usage: crew ${cmd} <Name> [--fresh]"
+            name="$1"
+            shift
+            for opt in "$@"; do
+                case "${opt}" in
+                    --fresh) have_fresh=1 ;;
+                    *) die "unknown option '${opt}' (crew ${cmd} <Name> [--fresh])" ;;
+                esac
+            done
+            [[ "${cmd}" == stop && "${have_fresh}" == 1 ]] && die "crew stop takes no --fresh"
+            [[ "${have_fresh}" == 1 ]] && mode=fresh
+            case "${cmd}" in
+                start)
+                    write_roster
+                    bring_up "${name}" "${mode}" detached
+                    ;;
+                stop) stop_member "${name}" ;;
+                restart)
+                    stop_member "${name}"
+                    write_roster
+                    bring_up "${name}" "${mode}" detached
+                    ;;
+            esac
             ;;
         -*) die "unknown option '$1'" ;;
         *)
