@@ -149,3 +149,33 @@ test('a plugin reload does not mark the member offline; only process exit does (
   assert.equal(beat.name, 'Probe')
   assert.notEqual(beat.state, 'offline')
 })
+
+test('the crew tools return the field OpenCode accepts for a tool with no output schema, and crew_log lands (#21)', async (t) => {
+  const dir = crewDirWith()
+  const ctx = fakeCtx([])
+  const teardown = await start(ctx, options(dir, memorySource()))
+  t.after(async () => { await teardown?.() })
+  const call = async (name: string, input: Record<string, unknown>) => {
+    const tool = ctx.tools[name]
+    assert.ok(tool, `${name} is registered`)
+    return tool.execute(input, { sessionID: SID })
+  }
+  const calls: [string, Record<string, unknown>][] = [
+    ['report_progress', { task: 'fix the schema', step: 1, of: 2 }],
+    ['crew_park', { parked: 0, reason: 'test' }],
+    ['crew_log', { package: 'macula-io/crew-code#21', event: 'checkpoint', note: 'seen red' }],
+    ['queue_ask', { ask: 'Delete the reload branch?' }],
+  ]
+  for (const [name, input] of calls) {
+    const result = await call(name, input)
+    assert.ok(!('output' in result), `${name} must not return output without an output schema`)
+    assert.equal(typeof result.content, 'string', `${name} returns content`)
+  }
+  // The crew_log line reaches the ledger the owner reads.
+  const ledger = join(dir, 'ledger', isoWeek(Date.now()), `${SID}.jsonl`)
+  await until(() => existsSync(ledger))
+  const line = JSON.parse(readFileSync(ledger, 'utf8').trim().split('\n').at(-1)!) as { event: string; package: string; name: string }
+  assert.equal(line.event, 'checkpoint')
+  assert.equal(line.package, 'macula-io/crew-code#21')
+  assert.equal(line.name, 'Probe')
+})

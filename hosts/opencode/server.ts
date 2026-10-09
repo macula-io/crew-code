@@ -383,7 +383,7 @@ export const start = async (ctx: Ctx, options: StartOptions = {}) => {
       execute: async (input: Record<string, unknown>, context: { sessionID: string }) => {
         await feed({ type: 'crew.progress', data: { ...input, sessionID: context.sessionID, at: Date.now() } })
         const progress = tracker.sessions[tracker.children[context.sessionID]?.root ?? context.sessionID]?.progress
-        return { output: progress ? `Progress noted: ${progress.step}/${progress.of} ${progress.task}` : 'Progress noted.' }
+        return { content: progress ? `Progress noted: ${progress.step}/${progress.of} ${progress.task}` : 'Progress noted.' }
       },
     })
     tools.add({
@@ -405,7 +405,7 @@ export const start = async (ctx: Ctx, options: StartOptions = {}) => {
         const reason = String(input.reason ?? '').slice(0, 160)
         parked ? write(parkPath(crewDir, name), reason) : rmSync(parkPath(crewDir, name), { force: true })
         await beatAll()
-        return { output: parked ? `${name} is parked (${reason}): wake-on-idle no longer wakes it. End your turn.` : `${name} is unparked (${reason}): wake-on-idle wakes it again to work the board.` }
+        return { content: parked ? `${name} is parked (${reason}): wake-on-idle no longer wakes it. End your turn.` : `${name} is unparked (${reason}): wake-on-idle wakes it again to work the board.` }
       },
     })
     tools.add({
@@ -426,10 +426,10 @@ export const start = async (ctx: Ctx, options: StartOptions = {}) => {
       execute: async (input: { package?: unknown; event?: unknown; note?: unknown }) => {
         const event = String(input.event ?? '')
         const ref = String(input.package ?? '').trim()
-        if (!LOG_EVENTS.includes(event)) return { output: `Not logged: event must be one of ${LOG_EVENTS.join(', ')}.` }
-        if (!PACKAGE_REF.test(ref)) return { output: 'Not logged: package must be a work package ref, org/repo#n.' }
+        if (!LOG_EVENTS.includes(event)) return { content: `Not logged: event must be one of ${LOG_EVENTS.join(', ')}.` }
+        if (!PACKAGE_REF.test(ref)) return { content: 'Not logged: package must be a work package ref, org/repo#n.' }
         ledger({ event, package: ref, note: String(input.note ?? '').slice(0, 200) })
-        return { output: `${event} logged for ${ref}.` }
+        return { content: `${event} logged for ${ref}.` }
       },
     })
     tools.add({
@@ -445,11 +445,11 @@ export const start = async (ctx: Ctx, options: StartOptions = {}) => {
       },
       execute: async (input: { ask?: unknown }, context: { sessionID: string }) => {
         const ask = String(input.ask ?? '').trim().slice(0, 300)
-        if (ask === '') return { output: 'Nothing queued: the ask is empty.' }
+        if (ask === '') return { content: 'Nothing queued: the ask is empty.' }
         const at = Date.now()
         const id = `${String(at).padStart(15, '0')}-${context.sessionID.slice(-8)}-${Math.random().toString(36).slice(2, 8)}`
         write(`${crewDir}/asks/${id}.json`, JSON.stringify({ from: name, ask, at }))
-        return { output: `Queued for ${owner}. Do not ask it now; carry on.` }
+        return { content: `Queued for ${owner}. Do not ask it now; carry on.` }
       },
     })
   })
