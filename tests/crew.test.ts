@@ -1329,3 +1329,106 @@ test('/crew-sound mutes the bell, the notification or both, crew-wide', async ($
   expect([bells(), notes().length]).toEqual([1, 1])
   expect(store.get('sound')).toBe('off')
 })
+
+// crew-code#16: the factory ledger. Append-only JSON lines, one file per session per ISO week, under
+// ~/.claude/crew/ledger/<week>/. The mod logs what it sees; crew_log records what only the crew knows.
+const LEDGER = '/home/test/.claude/crew/ledger'
+const ledgerOf = (files: Map<string, string>) =>
+  [...files.entries()].filter(([path]) => path.startsWith(`${LEDGER}/`)).flatMap(([, text]) => text.trim().split('\n').map(line => JSON.parse(line)))
+
+test('crew_log appends a milestone with the package, the member, its cost and the weekly gauge', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Supervisor']])
+  mock.clock(on, { now: NOW })
+  const { files } = crewSession(on, store, { percent: 20, rateLimits: [weekly(88, 3 * DAY)] })
+
+  const ran = await $.tool.call({ tool: 'mcp__crew__crew_log', package: 'macula-io/macula#75', event: 'assigned', note: 'to Mars' } as never)
+  await $.tool.call({ tool: 'mcp__crew__crew_log', package: 'macula-io/macula#75', event: 'owner_yes', note: '' } as never)
+
+  expect(String((ran as { result?: unknown }).result)).toContain('logged')
+  const events = ledgerOf(files)
+  expect(events).toHaveLength(2)
+  expect(events[0]).toMatchObject({ event: 'assigned', package: 'macula-io/macula#75', name: 'Supervisor', note: 'to Mars', weekly: 88, at: NOW })
+  expect([...files.keys()].some(path => /ledger\/\d{4}-W\d{2}\/id-crew\.jsonl$/.test(path))).toBe(true)
+})
+
+test('crew_log refuses an event it does not know, and logs nothing', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Mars']])
+  mock.clock(on, { now: NOW })
+  const { files } = crewSession(on, store, { percent: 20 })
+
+  const ran = await $.tool.call({ tool: 'mcp__crew__crew_log', package: 'macula-io/macula#75', event: 'vibes', note: '' } as never)
+
+  expect(String((ran as { result?: unknown }).result)).toContain('release')
+  expect(ledgerOf(files)).toHaveLength(0)
+})
+
+test('the mod logs a needs-you interval with how long the owner was waited on, tagged with the package', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Mars'], ['package:Mars', 'macula-io/macula#70']])
+  const clock = mock.clock(on, { now: NOW })
+  const { files } = crewSession(on, store, { percent: 20 })
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete(answer('Push 3 commits?'))
+  await clock.advance(90_000)
+  await $.turn.start({ text: 'yes', turnId: 't2' })
+
+  const waited = ledgerOf(files).filter(event => event.event === 'owner_wait')
+  expect(waited).toHaveLength(1)
+  expect(waited[0]).toMatchObject({ name: 'Mars', package: 'macula-io/macula#70', ms: 90_000 })
+})
+
+test('a claimed card and a menu shown are logged on their own', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Mars']])
+  mock.clock(on, { now: NOW })
+  const { files } = crewSession(on, store, { percent: 20 })
+  board(on, { card: { card_id: CARD, issue_ref: 'macula-io/macula#75', work_package: 'macula-io/macula#70' } })
+  on('tool.call', { tool: 'AskUserQuestion' }, () => ({ result: { answers: {} } }) as never)
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call(claimNext)
+  await $.tool.call({ tool: 'AskUserQuestion', questions: [] } as never)
+
+  const kinds = ledgerOf(files).map(event => `${event.event} ${event.package ?? ''}`.trim())
+  expect(kinds).toContain('card_claimed macula-io/macula#70')
+  expect(kinds).toContain('menu macula-io/macula#70')
+})
+
+test('/crew-report sums a week per package: cycle time, owner wait, rework, releases, cost; and per member', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Supervisor']])
+  mock.clock(on, { now: NOW })
+  const { files } = crewSession(on, store, { percent: 20 })
+  const pkg = 'macula-io/macula#75'
+  const line = (event: Record<string, unknown>) => JSON.stringify({ package: pkg, note: '', weekly: 88, ...event })
+  files.set(`${LEDGER}/1970-W01/id-sup.jsonl`, [
+    line({ event: 'assigned', name: 'Supervisor', at: 0, cost: 1 }),
+    line({ event: 'sent_back', name: 'Supervisor', at: 1_000, cost: 1.5 }),
+    line({ event: 'closed', name: 'Supervisor', at: 3 * 3600_000, cost: 2 }),
+  ].join('\n') + '\n')
+  files.set(`${LEDGER}/1970-W01/id-mars.jsonl`, [
+    line({ event: 'card_claimed', name: 'Mars', at: 60_000, cost: 10 }),
+    line({ event: 'owner_wait', name: 'Mars', at: 120_000, cost: 12, ms: 600_000 }),
+    line({ event: 'release', name: 'Mars', at: 2 * 3600_000, cost: 14.5 }),
+    line({ event: 'fix_after_ship', name: 'Mars', at: 2.5 * 3600_000, cost: 15 }),
+  ].join('\n') + '\n')
+
+  const report = (await $.command.run({ command: 'crew-report', args: '1970-W01' } as never)).text ?? ''
+
+  expect(report).toContain(pkg)
+  expect(report).toMatch(/cycle 3h/)
+  expect(report).toMatch(/owner wait 10m/)
+  expect(report).toMatch(/rework 2/)
+  expect(report).toMatch(/releases 1/)
+  expect(report).toMatch(/cost \$6\.00/)
+  expect(report).toMatch(/Mars.*\$5\.00/)
+})
+
+test('the Supervisor is told which milestones to log, members which of theirs', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  crewSession(on, new Map([['name:id-crew', 'Supervisor']]), { percent: 20 })
+  on('prompt.compose', () => ({ sections: [] }) as never)
+  const compose = { model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: [], tools: [], outputStyle: null, traits: [] } as never
+
+  const text = (await $.prompt.compose(compose)).sections.map((section: { text: string }) => section.text).join('\n')
+  expect(text).toContain('crew_log')
+  expect(text).toContain('owner_yes')
+})
