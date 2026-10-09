@@ -988,7 +988,7 @@ export const register: Register = (on, options) => {
     const budget = line
       ? [{
           id: 'crew:budget',
-          text: `Crew budget: ${line}. Read it before assigning: when the run-out comes before the reset, hold big packages for the reset and assign only small ones.`,
+          text: `Crew budget: ${line}. This is a measurement for ${OWNER}; change the crew's pace only when ${OWNER} says so.`,
           scope: 'session' as const,
         }]
       : []

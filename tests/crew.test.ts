@@ -1235,7 +1235,7 @@ test('/crew-budget sets the Fable gauge, and the dashboard shows it with when it
   expect(shown.text).toContain('Fable 56%')
 })
 
-test('the Supervisor reads the budget in its prompt, and holds big packages when it runs out before the reset', async ($, on) => {
+test('the Supervisor reads the budget in its prompt as a measurement, never as an order to slow down', async ($, on) => {
   const store = new Map<string, unknown>([['name:id-crew', 'Supervisor'], ['budget:fable', { percent: 56, at: NOW }]])
   mock.clock(on, { now: NOW })
   crewSession(on, store, { percent: 20, rateLimits: [weekly(91, 3 * DAY)] })
@@ -1246,4 +1246,6 @@ test('the Supervisor reads the budget in its prompt, and holds big packages when
   expect(budget).toContain('weekly 91%')
   expect(budget).toContain('Fable 56%')
   expect(budget).toContain('before the reset')
+  expect(budget).toContain("change the crew's pace only when the owner says so")
+  expect(budget).not.toMatch(/hold|only small/)
 })
