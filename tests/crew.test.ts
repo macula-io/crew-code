@@ -1433,3 +1433,73 @@ test('the Supervisor is told which milestones to log, members which of theirs', 
   expect(text).toContain('crew_log')
   expect(text).toContain('owner_yes')
 })
+
+// crew-code#9: a reviewing state, inferred from a reviewer subagent or a review skill, or declared.
+test('a reviewer subagent shows reviewing while it runs, then working again', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-fovea', 'Venus']])
+  mock.clock(on, { now: NOW })
+  const written = beatsWritten(on, store)
+  const during: string[] = []
+  on('tool.call', { tool: 'Agent' }, () => { during.push(written.at(-1)?.state ?? ''); return { result: { content: [] } } as never })
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call({ tool: 'Agent', subagent_type: 'faber-adversary', description: 'attack the design', prompt: 'x' } as never)
+  await $.tool.call({ tool: 'Agent', subagent_type: 'general-purpose', model: 'fable', description: 'review the diff', prompt: 'x' } as never)
+  await $.tool.call({ tool: 'Agent', subagent_type: 'Explore', description: 'find the handler', prompt: 'x' } as never)
+
+  expect(during).toEqual(['reviewing', 'reviewing', 'working'])
+  expect(written.at(-1)?.state).toBe('working')
+})
+
+test('a review skill shows reviewing while it runs', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-fovea', 'Venus']])
+  mock.clock(on, { now: NOW })
+  const written = beatsWritten(on, store)
+  let during = ''
+  on('tool.call', { tool: 'Skill' }, () => { during = written.at(-1)?.state ?? ''; return { result: 'ok' } as never })
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call({ tool: 'Skill', skill: 'code-review', args: 'high' } as never)
+
+  expect(during).toBe('reviewing')
+  expect(written.at(-1)?.state).toBe('working')
+})
+
+test('a reviewer still running in the background when the turn ends leaves the row reviewing, not waiting', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-fovea', 'Venus']])
+  mock.clock(on, { now: NOW })
+  const written = beatsWritten(on, store)
+  on('classic.Stop', () => ({}) as never)
+  on('agent.list', () => ({ value: [{ id: 'a1', status: 'running' }] }) as never)
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.classic.Stop({ stop_hook_active: false, background_tasks: [{ id: 'a1', type: 'subagent', agent_type: 'faber-adversary', description: 'review the claim' }], session_crons: [] } as never)
+  await $.turn.complete(answer('Fable is reviewing.'))
+
+  expect(written.at(-1)).toMatchObject({ state: 'reviewing', waitingOn: 'faber-adversary: review the claim' })
+})
+
+test('a member declares a review with report_progress phase, and it holds across tool calls until it says working', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-fovea', 'Venus']])
+  mock.clock(on, { now: NOW })
+  const written = beatsWritten(on, store)
+  on('tool.call', { tool: 'Read' }, () => ({ result: 'text' }) as never)
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call({ tool: 'mcp__crew__report_progress', task: 'review #48', step: 0, of: 3, phase: 'reviewing' } as never)
+  await $.tool.call({ tool: 'Read', file_path: '/w/a.erl' } as never)
+  expect(written.at(-1)?.state).toBe('reviewing')
+
+  await $.tool.call({ tool: 'mcp__crew__report_progress', task: 'fix #48', step: 1, of: 3, phase: 'working' } as never)
+  await $.tool.call({ tool: 'Read', file_path: '/w/a.erl' } as never)
+  expect(written.at(-1)?.state).toBe('working')
+})
+
+test('the dashboard draws a reviewing row', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  dashboardOf(on, [{ name: 'Venus', state: 'reviewing', lastTool: 'Agent' }])
+
+  await $.command.run({ command: 'crew', args: '' } as never)
+  const ui = await paneOf($)
+  expect(await ui.find({ text: /reviewing/ })).toBeDefined()
+})
