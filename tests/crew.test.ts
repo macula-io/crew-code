@@ -948,3 +948,185 @@ test('a board nobody serves is said on the dashboard and in the prompt, and nobo
   const composed = await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: [], tools: [], outputStyle: null, traits: [] } as never)
   expect(JSON.stringify(composed)).toContain('no board')
 })
+
+// crew-code#12: refresh on request in any mode, an honest needs-you list, the refresh shown on the row,
+// and an assignment that survives a refresh.
+const refreshTool = (reason: string) => ({ tool: 'mcp__crew__crew_refresh', reason }) as never
+
+test('crew_refresh refreshes a member in package mode, and leaves its mode as it was', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Mars'], ['refresh:Mars', 'package']])
+  const clock = mock.clock(on, { now: NOW })
+  const { prompts, files } = crewSession(on, store, { percent: 53 })
+  const beat = () => JSON.parse(files.get('/home/test/.claude/crew/id-crew.json') ?? '{}')
+
+  await $.turn.start({ text: 'refresh now please', turnId: 't1' })
+  const ran = await $.tool.call(refreshTool('the Supervisor asked'))
+  expect(String((ran as { result?: unknown }).result)).toContain('End your turn')
+  expect(beat().refresh.phase).toBe('due')
+
+  await $.turn.complete(answer('Refresh requested.'))
+  await clock.advance(600)
+  expect(prompts[0]).toContain('HANDOVER_2026-10-06_Mars.md')
+
+  await $.turn.complete(answer('Written.\nCREW-HANDOVER-WRITTEN', 't2'))
+  await clock.advance(600)
+  expect(prompts[1]).toContain('You are Mars')
+  expect(store.get('refresh:Mars')).toBe('package')
+})
+
+test('crew_refresh works with refresh off too, and a second call while one runs changes nothing', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Mars']])
+  mock.clock(on, { now: NOW })
+  crewSession(on, store, { percent: 30 })
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call(refreshTool('the owner asked'))
+  const again = await $.tool.call(refreshTool('asked twice'))
+
+  expect(String((again as { result?: unknown }).result)).toContain('already')
+  expect(store.has('refresh:Mars')).toBe(false)
+})
+
+test('an MCP elicitation needs the owner, naming the server, until it is answered', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-fovea', 'Jupiter']])
+  mock.clock(on, { now: NOW })
+  const written = beatsWritten(on, store)
+  on('classic.Elicitation', () => ({}) as never)
+  on('classic.ElicitationResult', () => ({}) as never)
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.classic.Elicitation({ mcp_server_name: 'macula', message: 'Approve the new key' } as never)
+  expect(written.at(-1)?.state).toBe('needs-you')
+  expect(written.at(-1)?.lastLine).toContain('macula')
+  expect(written.at(-1)?.lastLine).toContain('Approve the new key')
+
+  await $.classic.ElicitationResult({ mcp_server_name: 'macula', action: 'accept' } as never)
+  expect(written.at(-1)?.state).toBe('working')
+})
+
+test('an engine notification that wants the owner sets needs-you; the idle prompt does not', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-fovea', 'Jupiter']])
+  mock.clock(on, { now: NOW })
+  const written = beatsWritten(on, store)
+  on('classic.Notification', () => ({}) as never)
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete(answer('Done.'))
+  await $.classic.Notification({ notification_type: 'idle_prompt', message: 'Claude is waiting for your input' } as never)
+  expect(written.at(-1)?.state).toBe('idle')
+
+  await $.classic.Notification({ notification_type: 'plugin_reload', message: 'Enable hot reloading for this session?' } as never)
+  expect(written.at(-1)?.state).toBe('needs-you')
+  expect(written.at(-1)?.lastLine).toContain('Enable hot reloading')
+})
+
+const paneOf = async ($: { ui: { mount: (x: never) => Promise<{ find: (q: { text: RegExp }) => Promise<unknown> }> } }) =>
+  $.ui.mount({
+    plugin: 'crew', surface: 'terminal', component: 'Pane', requestId: 'crew',
+    props: { title: 'Crew', isFocused: false, bodyColumns: 140, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} },
+  } as never)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const dashboardOf = (on: any, rows: Record<string, unknown>[]) => {
+  mock.env(on, { HOME: '/home/test' })
+  const files = Object.fromEntries(rows.map(row => [`${String(row.name).toLowerCase()}.json`, JSON.stringify({ ...JSON.parse(beat(String(row.name), 'idle', NOW - 1_000)), ...row })]))
+  on('fs.exists', () => ({ value: true }))
+  on('fs.list', () => ({ value: Object.keys(files).map(name => ({ name, kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })) }))
+  on('fs.read', (_$: unknown, e: { path: string }) => ({ value: files[e.path.split('/').at(-1) ?? ''] ?? '' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+}
+
+test('the dashboard opens with a needs-you list naming each tab and what waits on the owner', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  dashboardOf(on, [
+    { name: 'Venus', state: 'needs-you', lastLine: 'Push 3 commits to macula-rust?' },
+    { name: 'Jupiter', state: 'needs-you', lastLine: 'macula asks: Approve the new key' },
+    { name: 'Mars', state: 'working', lastTool: 'Bash' },
+  ])
+
+  await $.command.run({ command: 'crew', args: '' } as never)
+  const ui = await paneOf($)
+  expect(await ui.find({ text: /needs you \(2\)/ })).toBeDefined()
+  expect(await ui.find({ text: /Venus tab: Push 3 commits to macula-rust\?/ })).toBeDefined()
+  expect(await ui.find({ text: /Jupiter tab: macula asks: Approve the new key/ })).toBeDefined()
+  expect(await ui.find({ text: /Mars tab/ })).toBeUndefined()
+})
+
+test('a waiting row says what it waits on, even when nothing was named', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  dashboardOf(on, [{ name: 'Mars', state: 'waiting', waitingOn: '' }])
+
+  await $.command.run({ command: 'crew', args: '' } as never)
+  const ui = await paneOf($)
+  expect(await ui.find({ text: /waiting on nothing it named/ })).toBeDefined()
+})
+
+test('after a refresh the row shows the context it dropped from', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Mars']])
+  const clock = mock.clock(on, { now: NOW })
+  const context = { percent: 53 }
+  const { files } = crewSession(on, store, context)
+  const beat = () => JSON.parse(files.get('/home/test/.claude/crew/id-crew.json') ?? '{}')
+
+  await $.command.run({ command: 'crew-refresh', args: 'now' } as never)
+  await clock.advance(600)
+  await $.turn.complete(answer('Written.\nCREW-HANDOVER-WRITTEN'))
+  context.percent = 4
+  await clock.advance(600)
+
+  expect(beat().refresh).toMatchObject({ fromPercent: 53 })
+})
+
+test('a refreshed row reads "refreshed 53% -> 4%"', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  dashboardOf(on, [{ name: 'Mars', contextPercent: 4, refresh: { threshold: 0, isAuto: false, isPackage: false, refreshedAt: NOW - 60_000, phase: 'none', fromPercent: 53 } }])
+
+  await $.command.run({ command: 'crew', args: '' } as never)
+  const ui = await paneOf($)
+  expect(await ui.find({ text: /refreshed 53% → 4%/ })).toBeDefined()
+})
+
+test('the resume prompt points at the card the member holds and its newest brief', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Mars']])
+  const clock = mock.clock(on, { now: NOW })
+  const { prompts, files } = crewSession(on, store, { percent: 30 })
+  board(on, { card: { card_id: CARD, issue_ref: 'macula-io/macula#75', work_package: 'macula-io/macula#70' } })
+  files.set('/home/test/.claude/sessions/BRIEF_2026-10-05_Mars.md', 'old brief')
+  files.set('/home/test/.claude/sessions/BRIEF_2026-10-06_Mars.md', 'the brief')
+  files.set('/home/test/.claude/sessions/BRIEF_2026-10-06_Venus.md', 'not mine')
+  on('fs.list', (_$: unknown, e: { path: string }) => ({
+    value: [...files.keys()].filter(path => path.startsWith(`${e.path}/`)).map(path => ({ name: path.split('/').at(-1), kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })),
+  }))
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call(claimNext)
+  await $.turn.complete(answer('Claimed.'))
+  await $.command.run({ command: 'crew-refresh', args: 'now' } as never)
+  await clock.advance(600)
+  await $.turn.complete(answer('Written.\nCREW-HANDOVER-WRITTEN', 't2'))
+  await clock.advance(600)
+
+  const resume = prompts.at(-1) ?? ''
+  expect(resume).toContain('macula-io/macula#75')
+  expect(resume).toContain('BRIEF_2026-10-06_Mars.md')
+  expect(resume).not.toContain('Venus')
+})
+
+test('the Supervisor is told to put each brief in a file, so it survives the member\'s refresh', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Supervisor']])
+  mock.clock(on, { now: NOW })
+  crewSession(on, store, { percent: 30 })
+  on('prompt.compose', () => ({ sections: [] }) as never)
+
+  const composed = await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: [], tools: [], outputStyle: null, traits: [] } as never)
+  expect(composed.sections.some((section: { text: string }) => section.text.includes('BRIEF_'))).toBe(true)
+})
+
+test('every member is told to call crew_refresh when told to refresh, not to write a handover by hand', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Mars']])
+  mock.clock(on, { now: NOW })
+  crewSession(on, store, { percent: 30 })
+  on('prompt.compose', () => ({ sections: [] }) as never)
+
+  const composed = await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: [], tools: [], outputStyle: null, traits: [] } as never)
+  expect(composed.sections.some((section: { text: string }) => section.text.includes('crew_refresh'))).toBe(true)
+})
