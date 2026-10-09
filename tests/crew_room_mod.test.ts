@@ -62,17 +62,20 @@ const roomSession = (on: any, name: string, opts: { hasRoom: boolean; inbox: unk
 }
 const page = (messages: unknown[], next: number) => ({ rooms: [{ room_topic: TOPIC, messages, next_after_seq: next }] })
 
-test('a member joins the crew room at session start and reads it by cursor, history skipped', async ($, on) => {
+test('a member fixes its cursor when it joins the room: history is skipped, a message after the join is delivered', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
-  const s = roomSession(on, 'Pluto', { hasRoom: true, inbox: [page([msg({ seq: 3 })], 5), page([], 5)] })
+  const after = msg({ seq: 6, message_id: '2'.repeat(32) })
+  const s = roomSession(on, 'Pluto', { hasRoom: true, inbox: [page([msg({ seq: 3 })], 5), page([after], 6)] })
   await $.session.start({ source: 'startup', cwd: '/w' } as never)
-  await clock.advance(10_000)
-  await clock.advance(10_000)
 
   expect(s.calls.find(c => c.tool === 'mesh_join_room')?.args).toEqual({ room_topic: TOPIC })
-  const reads = s.calls.filter(c => c.tool === 'mesh_read_inbox').map(c => c.args.after_seq)
-  expect(reads.slice(0, 2)).toEqual([undefined, 5])
-  expect(s.prompts.filter(p => p.includes('Crew room message'))).toEqual([])
+  expect(s.calls.filter(c => c.tool === 'mesh_read_inbox').map(c => c.args.after_seq)).toEqual([undefined])
+  await clock.advance(10_000)
+
+  expect(s.calls.filter(c => c.tool === 'mesh_read_inbox').map(c => c.args.after_seq)).toEqual([undefined, 5])
+  const delivered = s.prompts.filter(p => p.includes('Crew room message'))
+  expect(delivered.length).toBe(1)
+  expect(delivered[0]).toContain('2'.repeat(32))
 })
 
 test('the Supervisor opens the crew room when there is none, and writes its topic for the crew', async ($, on) => {
@@ -133,7 +136,7 @@ test('after asking Venus a question the row waits on her reply, until a reply na
   const clock = mock.clock(on, { now: NOW })
   const s = roomSession(on, 'Pluto', {
     hasRoom: true,
-    inbox: [page([], 5), page([msg({ seq: 6, kind: 'answer_given', in_reply_to: 'e'.repeat(32), message_id: '5'.repeat(32), text: 'yes' })], 6)],
+    inbox: [page([], 5), page([], 5), page([msg({ seq: 6, kind: 'answer_given', in_reply_to: 'e'.repeat(32), message_id: '5'.repeat(32), text: 'yes' })], 6)],
   })
   on('tool.call', { tool: 'mcp__macula__mesh_say' }, () =>
     ({ result: { content: [{ type: 'text', text: JSON.stringify({ sent: { message_id: 'e'.repeat(32), kind: 'question_asked', to: [VENUS] }, reply: null }) }] } }) as never)

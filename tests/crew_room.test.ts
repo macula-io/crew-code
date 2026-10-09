@@ -63,6 +63,14 @@ test('a message from the Supervisor says it may relay the owner\'s decision, nam
   expect(text).toMatch(/exact sha range/)
 })
 
+test('a long body is cut to a bounded size, saying so and where to read the rest', () => {
+  const text = fenceDelivery(env({ text: 'x'.repeat(50_000) }), { sender: 'Venus', isFromSupervisor: false }, { boundary: 'f'.repeat(16), owner: 'Raf', supervisor: 'Supervisor' })
+  expect(text.length).toBeLessThan(6_000)
+  expect(text).toMatch(/cut at 4000 of 50000 characters/)
+  expect(text).toMatch(/mesh_read_inbox/)
+  expect(text).toContain('1'.repeat(32))
+})
+
 test('waiting on a reply: a question or a handed-over task waits until a reply names it', () => {
   const asked = waitingOn({}, { type: 'sent', kind: 'question_asked', messageId: 'q1', to: ['Venus'] })
   expect(asked).toEqual({ q1: 'Venus' })
