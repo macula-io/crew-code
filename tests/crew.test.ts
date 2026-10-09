@@ -431,6 +431,8 @@ test('a title that is nobody on the roster yields to CREW_NAME', CREW, async ($,
 const crewSession = (on: any, store: Map<string, unknown>, context: { percent: number; rateLimits?: unknown[] }) => {
   const prompts: string[] = []
   const files = new Map<string, string>()
+  // Every /model the session is switched with, as the command ran.
+  const models: string[] = []
   mock.env(on, { HOME: '/home/test' })
   on('fs.exists', (_$: unknown, e: { path: string }) => ({ value: files.has(e.path) }))
   on('fs.read', (_$: unknown, e: { path: string }) => ({ value: files.get(e.path) ?? '' }))
@@ -460,11 +462,12 @@ const crewSession = (on: any, store: Map<string, unknown>, context: { percent: n
   on('turn.start', (_$: unknown, e: { turnId: string }) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
   on('command.run', { command: 'clear' }, () => ({ text: '' }))
+  on('command.run', { command: 'model' }, (_$: unknown, e: { args: string }) => { models.push(e.args); return { text: '' } })
   on('command.register', (_$: unknown, e: { name: string }) => ({ value: { command: e.name } }) as never)
   on('tool.register', (_$: unknown, e: { name: string }) => ({ value: { tool: `mcp__crew__${e.name}` } }) as never)
   on('session.start', () => ({ cwd: '/w' }) as never)
 
-  return { prompts, files }
+ return { prompts, files, models }
 }
 const CARD = 'card-0123456789abcdef0123456789abcdef'
 const claimNext = { tool: 'mcp__macula__mesh_call', procedure: 'mcl-kanban/claim_next_card', args: {} } as never
@@ -1556,4 +1559,101 @@ test('a row on the dashboard names its session model', async ($, on) => {
   await $.command.run({ command: 'crew', args: '' } as never)
   const ui = await paneOf($)
   expect(await ui.find({ text: /sonnet-5-5/ })).toBeDefined()
+})
+
+// crew-code#17: an assignment can name a model; the mod switches the member's live session to it with /model
+// (the engine runs a plugin's command as if the owner typed it, once the session is idle) and back to the
+// member's configured model when the package ends or the member parks.
+const switchTo = (model: string, pkg = 'macula-io/macula-torture#1', reason = 'torture run') =>
+  ({ tool: 'mcp__crew__crew_model', model, package: pkg, reason }) as never
+const MEMBER_MODELS = { options: { members: 'Mars, Venus', member_models: 'Mars:claude-opus-5-5', worker_model: 'claude-opus-5-5' } }
+
+test('crew_model switches the live session to the assignment\'s model once the turn is idle, and the row says why', MEMBER_MODELS, async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Mars']])
+  const clock = mock.clock(on, { now: NOW })
+  const { files, models } = crewSession(on, store, { percent: 20 })
+  const beat = () => JSON.parse(files.get('/home/test/.claude/crew/id-crew.json') ?? '{}')
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  const ran = await $.tool.call(switchTo('claude-sonnet-5-5'))
+  expect(String((ran as { result?: unknown }).result)).toContain('claude-sonnet-5-5')
+  await $.turn.complete(answer('Starting the torture run.'))
+  await clock.advance(600)
+
+  expect(models).toEqual(['claude-sonnet-5-5'])
+  expect(beat().modelWhy).toContain('macula-io/macula-torture#1')
+  expect(beat().modelWhy).toContain('claude-opus-5-5')
+})
+
+test('parking switches the member back to its configured model', MEMBER_MODELS, async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Mars']])
+  const clock = mock.clock(on, { now: NOW })
+  const { files, models } = crewSession(on, store, { percent: 20 })
+  const beat = () => JSON.parse(files.get('/home/test/.claude/crew/id-crew.json') ?? '{}')
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call(switchTo('claude-sonnet-5-5'))
+  await $.tool.call({ tool: 'mcp__crew__crew_park', parked: 1, reason: 'told to stop' } as never)
+  await $.turn.complete(answer('Parked.'))
+  await clock.advance(600)
+
+  expect(models).toEqual(['claude-sonnet-5-5', 'claude-opus-5-5'])
+  expect(beat().modelWhy ?? '').toBe('')
+})
+
+test('finishing a card of the switched package switches back; a card of another package does not', MEMBER_MODELS, async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Mars']])
+  const clock = mock.clock(on, { now: NOW })
+  const { models } = crewSession(on, store, { percent: 20 })
+  const finish = { tool: 'mcp__macula__mesh_call', procedure: 'mcl-kanban/finish_card', args: { card_id: CARD, result: 'done' } } as never
+  board(on, { ok: 1 })
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call(switchTo('claude-sonnet-5-5'))
+  store.set('package:Mars', 'macula-io/other#2')
+  await $.tool.call(finish)
+  await $.turn.complete(answer('One done.'))
+  await clock.advance(600)
+  expect(models).toEqual(['claude-sonnet-5-5'])
+
+  store.set('package:Mars', 'macula-io/macula-torture#1')
+  await $.turn.start({ text: 'go', turnId: 't2' })
+  await $.tool.call(finish)
+  await $.turn.complete(answer('Torture run done.', 't2'))
+  await clock.advance(600)
+  expect(models).toEqual(['claude-sonnet-5-5', 'claude-opus-5-5'])
+})
+
+test('crew_model back returns to worker_model when the member has no entry of its own', { options: { members: 'Venus', worker_model: 'claude-opus-5-5' } }, async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Venus']])
+  const clock = mock.clock(on, { now: NOW })
+  const { models } = crewSession(on, store, { percent: 20 })
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call(switchTo('claude-sonnet-5-5'))
+  await $.tool.call({ tool: 'mcp__crew__crew_model', model: 'back', package: 'macula-io/macula-torture#1', reason: 'done' } as never)
+  await $.turn.complete(answer('Done.'))
+  await clock.advance(600)
+
+  expect(models.at(-1)).toBe('claude-opus-5-5')
+})
+
+test('a row names the model it switched to and why', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  dashboardOf(on, [{ name: 'Mars', state: 'working', model: 'claude-sonnet-5-5', modelWhy: 'for macula-io/macula-torture#1 (torture run), back to claude-opus-5-5 after' }])
+
+  await $.command.run({ command: 'crew', args: '' } as never)
+  const ui = await paneOf($)
+  expect(await ui.find({ text: /for macula-io\/macula-torture#1/ })).toBeDefined()
+})
+
+test('the Supervisor is told to name a model in the brief, members to call crew_model with it', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  crewSession(on, new Map([['name:id-crew', 'Supervisor']]), { percent: 20 })
+  on('prompt.compose', () => ({ sections: [] }) as never)
+  const compose = { model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: [], tools: [], outputStyle: null, traits: [] } as never
+
+  const text = (await $.prompt.compose(compose)).sections.map((section: { text: string }) => section.text).join('\n')
+  expect(text).toContain('crew_model')
+  expect(text).toMatch(/brief/)
 })
