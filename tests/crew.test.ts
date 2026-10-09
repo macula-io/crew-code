@@ -1503,3 +1503,57 @@ test('the dashboard draws a reviewing row', async ($, on) => {
   const ui = await paneOf($)
   expect(await ui.find({ text: /reviewing/ })).toBeDefined()
 })
+
+// crew-code#10: worker and reviewer models. The reviewer model is enforced on review subagents.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const agentModels = (on: any) => {
+  const models: string[] = []
+  on('tool.call', { tool: 'Agent' }, (_$: unknown, e: { model?: string }) => { models.push(e.model ?? ''); return { result: { content: [] } } as never })
+  return models
+}
+
+test('a review subagent runs on the reviewer model, whatever the session asked for; other subagents are untouched', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-fovea', 'Venus']])
+  mock.clock(on, { now: NOW })
+  beatsWritten(on, store)
+  const models = agentModels(on)
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call({ tool: 'Agent', subagent_type: 'faber-adversary', model: 'opus', description: 'attack', prompt: 'x' } as never)
+  await $.tool.call({ tool: 'Agent', subagent_type: 'code-reviewer', description: 'review the diff', prompt: 'x' } as never)
+  await $.tool.call({ tool: 'Agent', subagent_type: 'Explore', model: 'haiku', description: 'find it', prompt: 'x' } as never)
+
+  expect(models).toEqual(['fable', 'fable', 'haiku'])
+})
+
+test('reviewer_model sets the model reviews run on', { options: { reviewer_model: 'opus' } }, async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-fovea', 'Venus']])
+  mock.clock(on, { now: NOW })
+  beatsWritten(on, store)
+  const models = agentModels(on)
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call({ tool: 'Agent', subagent_type: 'faber-adversary', description: 'attack', prompt: 'x' } as never)
+  await $.tool.call({ tool: 'Agent', subagent_type: 'general-purpose', model: 'opus', description: 'review the design', prompt: 'x' } as never)
+
+  expect(models).toEqual(['opus', 'opus'])
+})
+
+test('every session is told which model its reviews run on', { options: { reviewer_model: 'opus' } }, async ($, on) => {
+  mock.clock(on, { now: NOW })
+  crewSession(on, new Map([['name:id-crew', 'Mars']]), { percent: 20 })
+  on('prompt.compose', () => ({ sections: [] }) as never)
+  const compose = { model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: [], tools: [], outputStyle: null, traits: [] } as never
+
+  const text = (await $.prompt.compose(compose)).sections.map((section: { text: string }) => section.text).join('\n')
+  expect(text).toMatch(/[Rr]eviews run on opus/)
+})
+
+test('a row on the dashboard names its session model', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  dashboardOf(on, [{ name: 'Pluto', state: 'working', model: 'claude-sonnet-5-5' }])
+
+  await $.command.run({ command: 'crew', args: '' } as never)
+  const ui = await paneOf($)
+  expect(await ui.find({ text: /sonnet-5-5/ })).toBeDefined()
+})
