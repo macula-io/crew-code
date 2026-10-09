@@ -134,8 +134,9 @@ const joinCrewRoom = async ($: EngineInterface) => {
 
 const boundary = () => Array.from({ length: 16 }, () => Math.floor(Math.random() * 16).toString(16)).join('')
 
-// One read of the crew room after this session's cursor. The first read only sets the cursor: a fresh
-// session does not replay the room's history.
+// One read of the crew room after this session's cursor. The first read, right after the join, only sets the
+// cursor: a fresh session does not replay the room's history, and misses nothing that arrives after it joined.
+// The cursor moves past each message as it is handled, so a failed delivery loses none of the rest.
 const watchCrewRoom = async ($: EngineInterface) => {
   const room = await read($, crewRoom)
   if (!room.topic || !room.me) return
@@ -145,18 +146,20 @@ const watchCrewRoom = async ($: EngineInterface) => {
   const asked = await askMesh($, 'mesh_read_inbox', cursor === undefined ? { room_topic: room.topic, limit: 1 } : { room_topic: room.topic, after_seq: cursor, limit: 200 })
   const page = (asked.result?.rooms as { room_topic: string; messages?: RoomMessage[]; next_after_seq?: number }[] | undefined)?.find(r => r.room_topic === room.topic)
   if (!page) return
-  if (typeof page.next_after_seq === 'number') await $.store.set(key, page.next_after_seq)
-  if (cursor === undefined) return
+  if (cursor === undefined) {
+    if (typeof page.next_after_seq === 'number') await $.store.set(key, page.next_after_seq)
+    return
+  }
   let { waiting, dropped } = room
   for (const message of page.messages ?? []) {
     const accepted = acceptEnvelope(message, { me: room.me, roster: room.roster, supervisor: SUPERVISOR })
-    if (!accepted.deliver) {
-      if (accepted.reason !== 'own') dropped += 1
-      continue
-    }
-    waiting = waitingOn(waiting, { type: 'received', inReplyTo: message.in_reply_to })
-    await $.prompt.submit({ text: fenceDelivery(message, accepted, { boundary: boundary(), owner: OWNER, supervisor: SUPERVISOR }) })
+    if (accepted.deliver) {
+      waiting = waitingOn(waiting, { type: 'received', inReplyTo: message.in_reply_to })
+      await $.prompt.submit({ text: fenceDelivery(message, accepted, { boundary: boundary(), owner: OWNER, supervisor: SUPERVISOR }) })
+    } else if (accepted.reason !== 'own') dropped += 1
+    if (typeof message.seq === 'number') await $.store.set(key, message.seq)
   }
+  if (typeof page.next_after_seq === 'number') await $.store.set(key, page.next_after_seq)
   const answered = Object.keys(waiting).length < Object.keys(room.waiting).length
   await update($, crewRoom, held => ({ ...held, waiting, dropped }))
   const beat = await read($, me)
@@ -1057,6 +1060,7 @@ export const register: Register = (on, options) => {
     await loadBeats($)
     void loadGoal($)
     await joinCrewRoom($).catch(() => undefined)
+    await watchCrewRoom($).catch(() => undefined)
 
     return next(e)
   })
