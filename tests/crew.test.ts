@@ -1742,3 +1742,26 @@ test('crew_restart reports what the launcher refused (#24)', async ($, on) => {
   expect(String(ran.text ?? ran.result)).toContain('refusing to stop')
   expect(runs.at(-1)).toEqual(['crew', 'restart', 'Venus'])
 })
+
+// crew-code#24b: the dashboard flags a session whose room instructions have waited past the receipt
+// threshold, so a lost message is seen instead of assumed delivered.
+const RECEIPT_FILES: Record<string, string> = {
+  'supervisor.json': JSON.stringify({ ...JSON.parse(beat('Supervisor', 'idle', NOW - 5_000)), roomPending: { count: 2, oldestMinutes: 14 } }),
+}
+
+test('the pane flags a session whose room instructions wait past the receipt threshold (#24b)', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.env(on, { HOME: '/home/test' })
+  on('fs.exists', () => ({ value: true }))
+  on('fs.list', () => ({ value: Object.keys(RECEIPT_FILES).map(name => ({ name, kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })) }))
+  on('fs.read', (_$, e) => ({ value: RECEIPT_FILES[e.path.split('/').at(-1) ?? ''] ?? '' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+
+  await $.command.run({ command: 'crew', args: '' } as never)
+
+  const ui = await $.ui.mount({
+    plugin: 'crew', surface: 'terminal', component: 'Pane', requestId: 'crew',
+    props: { title: 'Crew', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 20 }, view: {} },
+  })
+  expect(await ui.find({ text: /room: 2 pending >10m/ })).toBeDefined()
+})

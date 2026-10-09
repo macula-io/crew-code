@@ -21,7 +21,7 @@ const text = (value: unknown) => ({ value: { content: [{ type: 'text', text: JSO
 // A session named `name`, with roster.json and (optionally) room.json in the crew directory, and a mesh whose
 // mesh_read_inbox answers come from `inbox` in turn.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const roomSession = (on: any, name: string, opts: { hasRoom: boolean; inbox: unknown[]; submitWaits?: Promise<void> }) => {
+const roomSession = (on: any, name: string, opts: { hasRoom: boolean; inbox: unknown[]; submitWaits?: Promise<void>; processRun?: (e: { argv: string[] }) => { value: { exitCode: number; stdout: string; stderr: string; isStdoutTruncated: boolean; isStderrTruncated: boolean } } }) => {
   const store = new Map<string, unknown>([['name:id-crew', name]])
   const files = new Map<string, string>([[`${CREW}/roster.json`, ROSTER]])
   if (opts.hasRoom) files.set(`${CREW}/room.json`, JSON.stringify({ topic: TOPIC, opened_by: SUP, at: 1 }))
@@ -41,7 +41,7 @@ const roomSession = (on: any, name: string, opts: { hasRoom: boolean; inbox: unk
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.turns', () => ({ value: 1 }))
   on('session.messages', () => ({ value: [] }))
-  on('process.run', () => ({ value: { exitCode: 0, stdout: '2026-10-09\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('process.run', (_$: unknown, e: { argv: string[] }) => opts.processRun?.(e) ?? ({ value: { exitCode: 0, stdout: '2026-10-09\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
   on('store.get', (_$: unknown, e: { key: string }) => ({ value: store.get(e.key) }))
   on('store.set', (_$: unknown, e: { key: string; value: unknown }) => { store.set(e.key, e.value); return { value: undefined } })
   on('store.delete', (_$: unknown, e: { key: string }) => { store.delete(e.key); return { value: undefined } })
@@ -245,4 +245,92 @@ test('every session is told the room, the roster, the reply kinds and the rules'
   expect(room?.text).toContain(TOPIC)
   expect(room?.text).toContain(`Venus: ${VENUS}`)
   expect(room?.text).toContain('not encrypted')
+})
+
+// crew-code#24b: exactly-once delivery keyed by message_id. The cursor moves first, but a reader that
+// hands the same message back (a rewound cursor, a duplicate row) must not become a second turn: the
+// delivered message ids are the backstop the #19 fix text asked for.
+test('the same message_id is delivered once, whatever the reader hands back (#24b)', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const once = msg({ seq: 6 })
+  const again = msg({ seq: 7 }) // the same message_id on a later row
+  const s = roomSession(on, 'Pluto', { hasRoom: true, inbox: [page([], 5), page([once], 6), page([again], 7)] })
+  await $.session.start({ source: 'startup', cwd: '/w' } as never)
+  await clock.advance(10_000)
+  await clock.advance(10_000)
+  expect(s.prompts.filter(p => p.includes('Crew room message')).length).toBe(1)
+})
+
+// crew-code#24b: the member's host acknowledges a delivery with a receipt fact on the room, published
+// through the macula server, no model turn: the supervisor sees the instruction arrived.
+test('a delivered message is acknowledged on the room with a receipt fact (#24b)', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const s = roomSession(on, 'Pluto', { hasRoom: true, inbox: [page([], 5), page([msg({ seq: 6 })], 6)] })
+  await $.session.start({ source: 'startup', cwd: '/w' } as never)
+  await clock.advance(10_000)
+  const receipt = s.calls.find(c => c.tool === 'mesh_publish' && JSON.stringify(c.args).includes('message_delivered'))
+  expect(receipt?.args.topic).toBe(TOPIC)
+  expect(receipt?.args.fact).toMatchObject({ message_delivered: { message_id: '1'.repeat(32), member: 'Pluto' } })
+})
+
+// crew-code#24b: the supervisor lists, per instruction, delivered / answered / pending. A receipt counts
+// only when the transcript's attesting publisher is one of the recipients; anything else stays pending.
+test('crew_receipts lists an instruction as pending, then delivered when its receipt arrives (#24b)', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const sentId = 'e'.repeat(32)
+  let receipts: unknown[] = []
+  const inbox = [page([], 5)]
+  roomSession(on, 'Supervisor', {
+    hasRoom: true,
+    inbox,
+    processRun: (e) =>
+      e.argv[0] === 'sqlite3'
+        ? { value: { exitCode: 0, stdout: JSON.stringify(receipts), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+        : { value: { exitCode: 0, stdout: '2026-10-09\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } },
+  })
+  on('tool.call', { tool: 'mcp__macula__mesh_say' }, () =>
+    ({ result: { content: [{ type: 'text', text: JSON.stringify({ sent: { message_id: sentId, kind: 'task_handed_over', to: [VENUS] }, reply: null }) }] } }) as never)
+
+  await $.session.start({ source: 'startup', cwd: '/w' } as never)
+  await clock.advance(10_000)
+  await $.tool.call({ tool: 'mcp__macula__mesh_say', room_topic: TOPIC, kind: 'task_handed_over', text: 'go', to: [VENUS] } as never)
+  const receipt = (at: number, publisher: string) => ({ raw_json: JSON.stringify({ message_delivered: { message_id: sentId, member: 'Venus', at } }), publisher })
+
+  expect(String((await $.tool.call({ tool: 'mcp__crew__crew_receipts' } as never)).result)).toMatch(/pending \d+ min/)
+
+  receipts = [receipt(NOW - 60_000, VENUS)]
+  expect(String((await $.tool.call({ tool: 'mcp__crew__crew_receipts' } as never)).result)).toContain('delivered')
+
+  // A receipt the station attributed to someone else is not this member's: still pending.
+  receipts = [receipt(NOW - 60_000, SUP)]
+  expect(String((await $.tool.call({ tool: 'mcp__crew__crew_receipts' } as never)).result)).toMatch(/pending \d+ min/)
+
+  // A reply that names the instruction answers it, receipt or not.
+  inbox.push(page([msg({ seq: 6, message_id: 'f'.repeat(32), from: VENUS, to: [SUP], kind: 'result_reported', in_reply_to: sentId, text: 'done' })], 6))
+  await clock.advance(10_000)
+  expect(String((await $.tool.call({ tool: 'mcp__crew__crew_receipts' } as never)).result)).toContain('acknowledged')
+})
+
+// crew-code#24b: an instruction to a member still without a receipt past the threshold is flagged on the
+// sender's beat, so the dashboard shows a lost message instead of assuming it arrived.
+test('a pending instruction past the receipt threshold is flagged on the beat (#24b)', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const s = roomSession(on, 'Supervisor', {
+    hasRoom: true,
+    inbox: [page([], 5)],
+    processRun: (e) =>
+      e.argv[0] === 'sqlite3'
+        ? { value: { exitCode: 0, stdout: '[]', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+        : { value: { exitCode: 0, stdout: '2026-10-09\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } },
+  })
+  on('tool.call', { tool: 'mcp__macula__mesh_say' }, () =>
+    ({ result: { content: [{ type: 'text', text: JSON.stringify({ sent: { message_id: 'e'.repeat(32), kind: 'task_handed_over', to: [VENUS] }, reply: null }) }] } }) as never)
+
+  await $.session.start({ source: 'startup', cwd: '/w' } as never)
+  await clock.advance(10_000)
+  await $.tool.call({ tool: 'mcp__macula__mesh_say', room_topic: TOPIC, kind: 'task_handed_over', text: 'go', to: [VENUS] } as never)
+  await clock.advance(11 * 60_000)
+
+  const beat = JSON.parse(s.files.get(`${CREW}/id-crew.json`) ?? '{}') as { roomPending?: { count: number; oldestMinutes: number } }
+  expect(beat.roomPending).toEqual({ count: 1, oldestMinutes: 11 })
 })

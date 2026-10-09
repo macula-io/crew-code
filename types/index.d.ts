@@ -56,6 +56,9 @@ export type CrewBeat = {
   // stranger's (a sender not on the roster). Its own, another member's and lifecycle envelopes are not
   // counted (#20; named roomDropped before it).
   roomRefused?: number
+  // Instructions this session sent to members with no delivery receipt yet, older than the receipt
+  // threshold: the dashboard flags them so a lost message is seen, not assumed delivered (#24b).
+  roomPending?: { count: number; oldestMinutes: number }
   startedAt: number
   beatAt: number
 }

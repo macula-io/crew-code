@@ -96,6 +96,65 @@ type CrewRoom = { topic: string; me: string; roster: Roster; waiting: Waiting; r
 const NO_ROOM: CrewRoom = { topic: '', me: '', roster: {}, waiting: {}, refused: 0 }
 const crewRoom = atom({ plugin: 'crew', key: 'room' } as const, NO_ROOM)
 
+// What this session sent to other members and when (#24b): the delivery receipts are listed per message.
+// A short history, newest last; `nodes` keeps the recipients' roster ids so a receipt's attesting publisher
+// can be matched to them, `to` keeps their names for reading.
+type SentItem = { messageId: string; kind: string; to: string[]; nodes: string[]; at: number; acknowledgedAt?: number }
+const sentOf = async ($: EngineInterface): Promise<SentItem[]> =>
+  ((await $.store.get(`room-sent:${await $.session.id()}`)) as SentItem[] | undefined) ?? []
+const saveSent = async ($: EngineInterface, sent: SentItem[]) =>
+  $.store.set(`room-sent:${await $.session.id()}`, sent.slice(-30))
+
+// How long an instruction may stay without a delivery receipt before the dashboard flags it (#24b).
+const RECEIPT_PENDING_MINUTES = 10
+
+// Delivery receipts (#24b): a receiving host publishes a `message_delivered` fact on the room; the shared
+// transcript keeps it with the station's attesting publisher -- the receiving member's own node id. Read
+// through sqlite3 (the same transcript the room reader and the OpenCode plugin use); when it is unavailable
+// the list says so instead of guessing.
+type Receipt = { messageId: string; publisher: string; at: number }
+const readReceipts = async ($: EngineInterface, topic: string): Promise<{ receipts: Receipt[]; error: string }> => {
+  const home = (await $.env.get('HOME')) ?? ''
+  const db = (await $.env.get('MACULA_MCP_LOBBY_TRANSCRIPT_DB')) || `${home}/.macula-mcp/lobby-transcript.sqlite3`
+  const sql = `SELECT raw_json, publisher FROM observed_facts WHERE topic = '${topic.replace(/'/g, "''")}' AND raw_json LIKE '%"message_delivered"%' ORDER BY id DESC LIMIT 200`
+  const ran = await $.process.run(['sqlite3', '-json', db, sql]).catch(() => null)
+  const receipts: Receipt[] = []
+  let error = ''
+  if (!ran || ran.exitCode !== 0) error = 'the room transcript could not be read (sqlite3)'
+  else {
+    try {
+      const rows = JSON.parse(ran.stdout.trim() || '[]') as { raw_json: string; publisher: string | null }[]
+      for (const row of rows) {
+        const fact = (JSON.parse(row.raw_json) as { message_delivered?: { message_id?: unknown; at?: unknown } }).message_delivered
+        if (!fact || typeof fact.message_id !== 'string') continue
+        receipts.push({ messageId: fact.message_id, publisher: String(row.publisher ?? ''), at: Number(fact.at) || 0 })
+      }
+    } catch {
+      error = 'the room transcript could not be parsed'
+    }
+  }
+  return { receipts, error }
+}
+
+// Per-instruction state (#24b): delivered when a receipt names it and was attested by one of its recipients,
+// answered when a reply named it, pending otherwise. An OpenCode member's host cannot publish receipts yet
+// (its plugin API has no MCP call), so an instruction to one is named as such, never flagged as lost.
+type SentState = SentItem & { deliveredAt?: number; opencode: boolean; pending: boolean; ageMinutes: number }
+const sentStates = async ($: EngineInterface, now: number): Promise<{ states: SentState[]; error: string }> => {
+  const sent = await sentOf($)
+  const room = await read($, crewRoom)
+  if (sent.length === 0 || !room.topic) return { states: [], error: '' }
+  const { receipts, error } = await readReceipts($, room.topic)
+  const memberBeats = await read($, beats)
+  const states = sent.map(item => {
+    const delivered = receipts.find(receipt => receipt.messageId === item.messageId && item.nodes.includes(receipt.publisher))
+    const opencode = item.to.some(name => ((memberBeats.find(beat => beat.name === name) as { agent?: string } | undefined)?.agent ?? '') === 'opencode')
+    const ageMinutes = Math.max(0, Math.round((now - item.at) / 60_000))
+    return { ...item, deliveredAt: delivered?.at, opencode, pending: delivered === undefined && item.acknowledgedAt === undefined, ageMinutes }
+  })
+  return { states, error }
+}
+
 // One macula MCP tool: its JSON answer, or why it failed.
 const askMesh = async ($: EngineInterface, tool: string, args: Record<string, unknown>) => {
   const answer = await $.mcp.call(MESH_SERVER, tool, args).catch((error: unknown) => ({
@@ -154,9 +213,14 @@ const readCrewRoom = async ($: EngineInterface) => {
   // `refused`, and a stale `dropped`), so every field is read over a fresh room's defaults.
   const room: CrewRoom = { ...NO_ROOM, ...(await read($, crewRoom)) }
   if (!room.topic || !room.me) return
-  const key = `room-seq:${await $.session.id()}`
+  const session = await $.session.id()
+  const key = `room-seq:${session}`
   const held = await $.store.get(key)
   const cursor = typeof held === 'number' ? held : undefined
+  // One message_id is one turn (#24b): a bounded backstop under the cursor, so a reader that hands a
+  // row back (a rewound cursor, a duplicate row) cannot deliver the message again.
+  const deliveredKey = `room-delivered:${session}`
+  const delivered = new Set<string>(((await $.store.get(deliveredKey)) as string[] | undefined) ?? [])
   const asked = await askMesh($, 'mesh_read_inbox', cursor === undefined ? { room_topic: room.topic, limit: 1 } : { room_topic: room.topic, after_seq: cursor, limit: 200 })
   const page = (asked.result?.rooms as { room_topic: string; messages?: RoomMessage[]; next_after_seq?: number }[] | undefined)?.find(r => r.room_topic === room.topic)
   if (!page) return
@@ -169,8 +233,27 @@ const readCrewRoom = async ($: EngineInterface) => {
     const accepted = acceptEnvelope(message, { me: room.me, roster: room.roster, supervisor: SUPERVISOR })
     if (typeof message.seq === 'number') await $.store.set(key, message.seq)
     if (accepted.deliver) {
+      if (delivered.has(message.message_id)) continue
+      // A reply that names one of this session's instructions answers it (#24b): the receipt list says so.
+      if (message.in_reply_to) {
+        const sentItems = await sentOf($)
+        const at = sentItems.findIndex(item => item.messageId === message.in_reply_to)
+        if (at >= 0 && sentItems[at].acknowledgedAt === undefined) {
+          sentItems[at] = { ...sentItems[at], acknowledgedAt: await $.clock.now() }
+          await saveSent($, sentItems)
+        }
+      }
       waiting = waitingOn(waiting, { type: 'received', inReplyTo: message.in_reply_to })
       await $.prompt.submit({ text: fenceDelivery(message, accepted, { boundary: boundary(), owner: OWNER, supervisor: SUPERVISOR }) })
+      delivered.add(message.message_id)
+      await $.store.set(deliveredKey, [...delivered].slice(-200))
+      // The host acknowledges the delivery with a receipt fact on the room (#24b): published through the
+      // macula server, no model turn, so the supervisor can see the instruction arrived. A failure here
+      // never fails the delivery, and a second receipt for the same message_id is the same receipt.
+      await askMesh($, 'mesh_publish', {
+        topic: room.topic,
+        fact: { message_delivered: { message_id: message.message_id, member: await currentName($), node: room.me, from: message.from, at: await $.clock.now() } },
+      })
     } else if (accepted.reason === 'unattested' || accepted.reason === 'not_on_roster') {
       // Only a forgery or a stranger is the row's count (#20): its own, another member's and lifecycle
       // envelopes are ordinary traffic and must not make it climb.
@@ -192,6 +275,20 @@ const noteSent = async ($: EngineInterface, ran: { result?: unknown }) => {
   const room = await read($, crewRoom)
   const to = (sent.to ?? []).map(id => nameOf(room.roster, id) ?? id.slice(0, 8))
   await update($, crewRoom, held => ({ ...held, waiting: waitingOn(held.waiting, { type: 'sent', kind: sent.kind ?? '', messageId: sent.message_id ?? '', to }) }))
+  // Instructions to other members are tracked for their delivery receipts (#24b); the session's own id
+  // and broadcasts (no `to`) are not.
+  const nodes = (sent.to ?? []).filter(id => id !== room.me)
+  if (nodes.length > 0) {
+    const held = await sentOf($)
+    const item: SentItem = {
+      messageId: sent.message_id,
+      kind: sent.kind,
+      to: nodes.map(id => nameOf(room.roster, id) ?? id.slice(0, 8)),
+      nodes,
+      at: await $.clock.now(),
+    }
+    await saveSent($, [...held.filter(entry => entry.messageId !== item.messageId), item])
+  }
 }
 
 const goalOf = (result: Record<string, unknown>): CrewGoal | null => {
@@ -243,6 +340,9 @@ const RESTART_TOOL = 'mcp__crew__crew_restart'
 // never race on one file), until the Supervisor offers them together in one multi-select menu.
 const QUEUE_TOOL = 'mcp__crew__queue_ask'
 const TAKE_TOOL = 'mcp__crew__take_asks'
+// The supervisor lists its instructions and their delivery state on demand (#24b): delivered, answered,
+// or pending past the receipt threshold. Read-only.
+const RECEIPTS_TOOL = 'mcp__crew__crew_receipts'
 const asksDir = async ($: EngineInterface) => `${await crewDir($)}/asks`
 const askFilesOf = async ($: EngineInterface) => {
   const dir = await asksDir($)
@@ -853,6 +953,17 @@ const refreshOf = async ($: EngineInterface, name: string) => {
 // one keep firing under its id; without this they write a ghost row that never goes offline.
 const ended = new Set<string>()
 
+// The dashboard flag (#24b): instructions to members past the receipt threshold without a delivery
+// receipt. Computed on a beat only when this session has sent anything to a member.
+const pendingFlagOf = async ($: EngineInterface): Promise<{ count: number; oldestMinutes: number } | undefined> => {
+  const sent = await sentOf($)
+  if (sent.length === 0) return undefined
+  const { states } = await sentStates($, await $.clock.now())
+  const flagged = states.filter(state => state.pending && !state.opencode && state.ageMinutes > RECEIPT_PENDING_MINUTES)
+  if (flagged.length === 0) return undefined
+  return { count: flagged.length, oldestMinutes: Math.max(...flagged.map(state => state.ageMinutes)) }
+}
+
 const writeBeat = async ($: EngineInterface, change: Partial<CrewBeat>) => {
   const sessionId = await $.session.id()
   if (ended.has(sessionId)) return
@@ -882,6 +993,7 @@ const writeBeat = async ($: EngineInterface, change: Partial<CrewBeat>) => {
     weekly: weeklyOf(usage.rateLimits),
     modelWhy: await modelWhyOf($, change.name ?? name),
     roomRefused: (await read($, crewRoom)).refused,
+    roomPending: await pendingFlagOf($),
     startedAt: usage.startedAt,
     beatAt: await $.clock.now(),
   }
@@ -1113,6 +1225,13 @@ export const register: Register = (on, options) => {
     await $.tool.register({
       name: 'take_asks',
       description: `Take every queued routine ask, oldest first, to offer them to ${OWNER} in one multi-select menu. The queue is emptied.`,
+      inputSchema: { type: 'object', properties: {} },
+    })
+    await $.tool.register({
+      name: 'crew_receipts',
+      description:
+        'List the instructions this session sent to members and their delivery state, one line per message: delivered, answered, or pending. ' +
+        "The receiving host acknowledges a delivery with a receipt fact on the room; an OpenCode member's host cannot publish one yet, and its lines say so. Read-only.",
       inputSchema: { type: 'object', properties: {} },
     })
     await writeBeat($, { state: 'idle' })
@@ -1563,6 +1682,24 @@ export const register: Register = (on, options) => {
     }
   })
 
+  on('tool.call', { tool: RECEIPTS_TOOL }, async ($) => {
+    const now = await $.clock.now()
+    const { states, error } = await sentStates($, now)
+    if (states.length === 0) return { result: 'No instructions sent to members yet.' }
+    const lines = states.slice(-10).map(state => {
+      const who = state.to.join(', ')
+      if (state.deliveredAt !== undefined) {
+        const acknowledged = state.acknowledgedAt !== undefined ? `, acknowledged ${ago(now, state.acknowledgedAt)} ago` : ''
+        return `- ${state.messageId.slice(0, 8)} to ${who}: delivered ${ago(now, state.deliveredAt)} ago${acknowledged}`
+      }
+      if (state.acknowledgedAt !== undefined) return `- ${state.messageId.slice(0, 8)} to ${who}: acknowledged ${ago(now, state.acknowledgedAt)} ago (no delivery receipt)`
+      if (state.opencode) return `- ${state.messageId.slice(0, 8)} to ${who}: no receipt (host cannot publish yet)`
+      return `- ${state.messageId.slice(0, 8)} to ${who}: pending ${state.ageMinutes} min${state.ageMinutes > RECEIPT_PENDING_MINUTES ? ' (past the receipt threshold)' : ''}`
+    })
+
+    return { result: [error !== '' ? `Note: ${error}.` : '', ...lines].filter(Boolean).join('\n') }
+  })
+
   on('tool.call', { tool: REFRESH_TOOL }, async ($, e) => {
     const reason = String((e as unknown as { reason?: unknown }).reason ?? '').slice(0, 160)
     const flow = await read($, refreshFlow)
@@ -1733,6 +1870,7 @@ export const register: Register = (on, options) => {
                 {beat.model ? <Text dimColor>{` · ${beat.model.replace(/^claude-/, '')}`}</Text> : null}
                 {beat.modelWhy ? <Text color="cyan">{` ${beat.modelWhy}`}</Text> : null}
                 {beat.roomRefused ? <Text color="yellow">{` · room: ${beat.roomRefused} refused`}</Text> : null}
+                {beat.roomPending ? <Text color="yellow">{` · room: ${beat.roomPending.count} pending >${RECEIPT_PENDING_MINUTES}m`}</Text> : null}
               </Text>
               {beat.progress && !isOff && (() => {
                 const { task, step, of } = beat.progress
