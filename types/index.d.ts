@@ -50,6 +50,8 @@ export type CrewBeat = {
   isParked?: boolean
   // The account's weekly window as this session last read it (seven_day): percent used, reset (ms).
   weekly?: CrewWeekly | null
+  // Why the session runs on another model than its own, '' when it runs on its own (#17).
+  modelWhy?: string
   startedAt: number
   beatAt: number
 }

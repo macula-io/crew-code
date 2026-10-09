@@ -281,6 +281,44 @@ const isReviewAgent = (e: { subagent_type?: unknown; description?: unknown }) =>
 const isReviewCall = (e: { tool: string; subagent_type?: unknown; description?: unknown; model?: unknown; skill?: unknown }) =>
   (e.tool === 'Agent' && (isReviewAgent(e) || String(e.model ?? '') === REVIEWER_MODEL)) ||
   (e.tool === 'Skill' && isReviewText(String(e.skill ?? '')))
+// Model switching (#17): an assignment can name a model. The member calls crew_model when it starts the package;
+// the mod switches the live session with /model (the engine runs a plugin's command as if the owner typed it, once
+// the session is idle) and switches back to the member's configured model (member_models, else worker_model) when
+// the member finishes or releases a card of that package, parks, or asks. Kept by name: a refresh keeps it.
+const MODEL_TOOL = 'mcp__crew__crew_model'
+let WORKER_MODEL = ''
+let MEMBER_MODELS = new Map<string, string>()
+type ModelSwitch = { model: string; package: string; reason: string; home: string }
+const switchOf = async ($: EngineInterface, name: string) => {
+  const held = (await $.store.get(`switched:${name}`).catch(() => undefined)) as ModelSwitch | undefined
+  return held && typeof held.model === 'string' ? held : null
+}
+const modelWhyOf = async ($: EngineInterface, name: string) => {
+  const held = await switchOf($, name)
+  return held ? `for ${held.package} (${held.reason}), back to ${held.home} after` : ''
+}
+const homeModelOf = async ($: EngineInterface, name: string) =>
+  MEMBER_MODELS.get(name.toLowerCase()) || WORKER_MODEL || (await $.session.model())
+// Out of the turn's hook: a plugin's command cannot run inside a hook the turn waits on; the engine runs it once idle.
+const runModel = ($: EngineInterface, model: string) =>
+  $.clock.after(500, () => void $.command.run({ command: 'model', args: model }).catch(() => null))
+const switchBack = async ($: EngineInterface, name: string) => {
+  const held = await switchOf($, name)
+  if (!held) return false
+  await $.store.delete(`switched:${name}`)
+  runModel($, held.home)
+  await writeBeat($, {})
+  return true
+}
+const modelPrompt = (isSupervisor: boolean) =>
+  isSupervisor
+    ? 'Crew models: when a package should run on another model (a torture run on a cheaper one), name it in the brief ' +
+      '("on claude-sonnet-5-5"); the member switches with crew_model and back when the package ends. A switch happens only ' +
+      'because an assignment asks for it, never because of usage limits.'
+    : 'Crew models: when your assignment names a model, call crew_model with it, the package and why when you start the package. ' +
+      'The crew mod switches this session after the turn, and back to your own model when you finish or release a card of that ' +
+      'package, park, or call crew_model with model back. Never switch on your own.'
+
 const reviewerPrompt = () =>
   `Crew reviews: reviews run on ${REVIEWER_MODEL}. When you spawn a subagent to review or attack work, the crew mod runs it on ${REVIEWER_MODEL}; ` +
   'name it as a review in its type or description so the dashboard shows it.'
@@ -725,6 +763,7 @@ const writeBeat = async ($: EngineInterface, change: Partial<CrewBeat>) => {
     costUsd: usage.cost?.usd ?? null,
     fiveHourPercent: usage.rateLimits.find(limit => limit.kind === 'five_hour')?.percentUsed ?? null,
     weekly: weeklyOf(usage.rateLimits),
+    modelWhy: await modelWhyOf($, change.name ?? name),
     startedAt: usage.startedAt,
     beatAt: await $.clock.now(),
   }
@@ -806,7 +845,14 @@ let openElicitation: Pick<CrewBeat, 'state' | 'lastLine' | 'lastTool'> | null = 
 const NOT_FOR_THE_OWNER = ['idle_prompt', 'auth_success', 'permission_prompt', 'elicitation_dialog']
 
 export const register: Register = (on, options) => {
-  const settings = options as { supervisor?: string; members?: string; owner?: string; board?: string; realm?: string; reviewer_model?: string }
+  const settings = options as { supervisor?: string; members?: string; owner?: string; board?: string; realm?: string; reviewer_model?: string; worker_model?: string; member_models?: string }
+  WORKER_MODEL = settings.worker_model?.trim() ?? ''
+  MEMBER_MODELS = new Map(
+    namesOf(settings.member_models ?? '')
+      .map(pair => pair.split(':').map(part => part.trim()))
+      .filter(([name, model]) => name && model)
+      .map(([name, model]) => [String(name).toLowerCase(), String(model)]),
+  )
   REVIEWER_MODEL = REVIEWER_MODELS.includes(settings.reviewer_model?.trim() ?? '') ? (settings.reviewer_model ?? '').trim() : 'fable'
   BOARD = settings.board === 'off' ? 'off' : 'mesh'
   REALM = /^[0-9a-f]{64}$/i.test(settings.realm?.trim() ?? '') ? (settings.realm ?? '').trim().toLowerCase() : ''
@@ -874,6 +920,21 @@ export const register: Register = (on, options) => {
         type: 'object',
         properties: { ask: { type: 'string', description: 'The question, answerable yes or no, naming exactly what would be done' } },
         required: ['ask'],
+      },
+    })
+    await $.tool.register({
+      name: 'crew_model',
+      description:
+        `Switch this session to the model your assignment names, when you start that package, or back with model "back". ` +
+        'The crew mod switches after this turn, and back to your own model when you finish or release a card of that package or park.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          model: { type: 'string', description: 'The model the assignment names (a full id like claude-sonnet-5-5, or an alias), or "back"' },
+          package: { type: 'string', description: 'The work package it is for, org/repo#n' },
+          reason: { type: 'string', description: 'Why, in a few words, as the assignment says it' },
+        },
+        required: ['model', 'package', 'reason'],
       },
     })
     await $.tool.register({
@@ -1170,6 +1231,7 @@ export const register: Register = (on, options) => {
     const ledger = [
       { id: 'crew:ledger', text: ledgerRulePrompt(isSupervisor), scope: 'session' as const },
       { id: 'crew:reviews', text: reviewerPrompt(), scope: 'session' as const },
+      { id: 'crew:models', text: modelPrompt(isSupervisor), scope: 'session' as const },
     ]
 
     return { ...composed, sections: [...composed.sections, ...board, ...progress, ...refresh, ...briefs, ...asks, ...budget, ...ledger] }
@@ -1206,7 +1268,12 @@ export const register: Register = (on, options) => {
       await logEvent($, { event: 'card_claimed', package: claimed.workPackage || undefined, note: claimed.issueRef })
       if (crosses) return withNote(ran, PACKAGE_HANDOVER_NOTE)
     }
-    if (procedure === 'mcl-kanban/finish_card' || procedure === 'mcl-kanban/release_card') await $.store.delete(`card:${await currentName($)}`)
+    if (procedure === 'mcl-kanban/finish_card' || procedure === 'mcl-kanban/release_card') {
+      const name = await currentName($)
+      await $.store.delete(`card:${name}`)
+      const held = await switchOf($, name)
+      if (held && held.package === (await packageOf($))) await switchBack($, name)
+    }
     if (procedure === 'mcl-kanban/finish_card') {
       await logEvent($, { event: 'card_finished', package: await packageOf($), note: (await read($, cardStart))?.issueRef ?? '' })
       await logCardUsage($, String(call.args?.card_id ?? ''), percent)
@@ -1240,8 +1307,28 @@ export const register: Register = (on, options) => {
     const isParked = Number(input.parked) === 1
     const reason = String(input.reason ?? '').slice(0, 160)
     await setParked($, name, isParked)
+    if (isParked) await switchBack($, name)
 
     return { result: isParked ? `${name} is parked (${reason}): wake-on-idle no longer wakes it. End your turn.` : `${name} is unparked (${reason}): wake-on-idle wakes it again to work the board.` }
+  })
+
+  on('tool.call', { tool: MODEL_TOOL }, async ($, e) => {
+    const input = e as unknown as { model?: unknown; package?: unknown; reason?: unknown }
+    const model = String(input.model ?? '').trim()
+    const ref = String(input.package ?? '').trim()
+    const name = await currentName($)
+    if (model === 'back') {
+      const held = await switchOf($, name)
+      return { result: (await switchBack($, name)) ? `Switching back to ${held?.home} after this turn.` : 'This session already runs on its own model.' }
+    }
+    if (!/^[a-z0-9][a-z0-9.-]*$/i.test(model)) return { result: 'Not switched: model must be a model id or alias, like claude-sonnet-5-5.' }
+    if (!PACKAGE_REF.test(ref)) return { result: 'Not switched: package must be a work package ref, org/repo#n.' }
+    const home = (await switchOf($, name))?.home ?? (await homeModelOf($, name))
+    await $.store.set(`switched:${name}`, { model, package: ref, reason: String(input.reason ?? '').slice(0, 80), home })
+    runModel($, model)
+    await writeBeat($, {})
+
+    return { result: `Switching to ${model} for ${ref} after this turn; back to ${home} when the package's card is finished or released, or you park.` }
   })
 
   on('tool.call', { tool: LOG_TOOL }, async ($, e) => {
@@ -1448,6 +1535,7 @@ export const register: Register = (on, options) => {
                 {beat.isParked && <Text color="yellow">parked </Text>}
                 {beat.repo}
                 {beat.model ? <Text dimColor>{` · ${beat.model.replace(/^claude-/, '')}`}</Text> : null}
+                {beat.modelWhy ? <Text color="cyan">{` ${beat.modelWhy}`}</Text> : null}
               </Text>
               {beat.progress && !isOff && (() => {
                 const { task, step, of } = beat.progress
