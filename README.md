@@ -106,6 +106,8 @@ crew ls
 
 It needs kitty with `allow_remote_control yes`. Members are the `ROLE_<Name>.md` cards in `~/.claude/sessions`, plus the supervisor. Environment: `CREW_WORKDIR` (where sessions start, default `$HOME`), `CREW_SUPERVISOR`, `CREW_MODEL` (overrides `member_models` and `worker_model` for every session), `CREW_DRY_RUN=1` to print launches, `CREW_HOLD=1` to start sessions on hold (they read their card and handover, park themselves and wait to be told to resume).
 
+`CREW_AGENT=opencode crew <Name>` starts that member on OpenCode instead, on `CREW_OPENCODE_MODEL` (`provider/model`). It shows on the same dashboard; what maps and what does not is in [hosts/opencode/README.md](hosts/opencode/README.md) (a prototype).
+
 ## What you need for what
 
 | You want | You need |
@@ -122,6 +124,7 @@ When `board` is `mesh` and there is no board for this member (nothing serves `mc
 ```
 claude plugin validate .
 claude plugin test .
+node --test hosts/opencode/beat.node-test.ts    # the OpenCode adapter
 ```
 
 Load a working copy with `claude --plugin-dir <this folder>`, or list it in `CLAUDE_CODE_PLUGIN_DIRS`.

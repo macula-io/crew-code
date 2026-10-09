@@ -11,6 +11,9 @@
 # Each session runs claude with CREW_NAME=<Name>, MACULA_MCP_AGENT=<name> and -n <Name>.
 # Each session runs on its model: CREW_MODEL if set, else the member's own entry in the crew plugin's
 # member_models setting, else its worker_model setting, else claude-opus-5-5.
+# CREW_AGENT=opencode runs a member on OpenCode instead (hosts/opencode/README.md):
+#   CREW_AGENT=opencode crew <Name> [--fresh] [--tab]
+# on CREW_OPENCODE_MODEL (provider/model) if set, else OpenCode's own default model.
 # Set CREW_DRY_RUN=1 to print the launch instead of running it.
 # Set CREW_HOLD=1 to start sessions on hold: they read their card and handover, then wait.
 set -euo pipefail
@@ -27,8 +30,17 @@ LIVE_WINDOW_S=600
 # The crew plugin's settings, as /config writes them.
 SETTINGS="${HOME}/.claude/settings.json"
 DEFAULT_MODEL=claude-opus-5-5
+# The coding agent a member runs on: claude (default) or opencode.
+AGENT="${CREW_AGENT:-claude}"
+# The OpenCode plugin that puts an OpenCode member on the dashboard, next to this script.
+OPENCODE_PLUGIN="${CREW_OPENCODE_PLUGIN:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/hosts/opencode}"
 
 die() { echo "crew: $*" >&2; exit 1; }
+
+case "${AGENT}" in
+    claude | opencode) ;;
+    *) die "CREW_AGENT is '${AGENT}': it is claude or opencode" ;;
+esac
 
 # One of the crew plugin's settings, or nothing.
 crew_option() {
@@ -121,7 +133,18 @@ resume_prompt() {
     echo "You are $1. The crew launcher resumed this session. Read any messages that came in for you. ${BOARD_LINE}"
 }
 
-# launch <tab|here> <Name> <cwd> <claude args...>: a new kitty tab, or exec in this terminal.
+# The OpenCode config a member runs with: the crew plugin, the member's mesh key, its model.
+opencode_config() {
+    jq -cn --arg plugin "file://${OPENCODE_PLUGIN}" --arg key "${KEYS}/agent-$1.key" --arg model "${CREW_OPENCODE_MODEL:-}" \
+        '{plugins: [$plugin], mcp: {macula: {environment: {MACULA_MCP_IDENTITY: $key}}}} + (if $model == "" then {} else {model: $model} end)'
+}
+
+# The coding agent that wrote a session's beat: opencode, or claude for a beat that names none.
+beat_agent() {
+    jq -r '.agent // "claude"' "${BEATS}/$1.json" 2>/dev/null || echo claude
+}
+
+# launch <tab|here> <Name> <cwd> <agent args...>: a new kitty tab, or exec in this terminal.
 launch() {
     local where="$1" name="$2" cwd="$3"
     shift 3
@@ -135,6 +158,14 @@ launch() {
     # the API key instead of the claude.ai login, so it is dropped here.
     local cmd=("${SHELL:-/usr/bin/zsh}" -ic 'exec "$@"' crew
         env -u MACULA_MCP_IDENTITY -u ANTHROPIC_API_KEY "CREW_NAME=${name}" "MACULA_MCP_AGENT=${agent}" claude --model "${model}" -n "${name}" "$@")
+    if [[ "${AGENT}" == opencode ]]; then
+        # --standalone: a private server, so the plugin runs in this member's process and reads its
+        # CREW_NAME. The member's mesh key goes through the config: OpenCode starts an MCP server
+        # with the environment its config names.
+        cmd=("${SHELL:-/usr/bin/zsh}" -ic 'exec "$@"' crew
+            env -u MACULA_MCP_IDENTITY -u MACULA_MCP_AGENT -u ANTHROPIC_API_KEY "CREW_NAME=${name}" "CREW_SUPERVISOR=${SUPERVISOR}"
+            "OPENCODE_CONFIG_CONTENT=$(opencode_config "${agent}")" opencode --standalone "$@")
+    fi
     if [[ -n "${CREW_DRY_RUN:-}" ]]; then
         printf '[%s] cd %q &&' "${where}" "${cwd}"
         printf ' %q' "${cmd[@]}"
@@ -172,6 +203,10 @@ bring_up() {
         return 0
     fi
     adopt_key "${name}"
+    if [[ "${AGENT}" == opencode ]]; then
+        bring_up_opencode "${name}" "${mode}" "${where}"
+        return 0
+    fi
     if [[ "${mode}" == resume ]]; then
         beat="$(last_beat "${name}")"
         sid="${beat%% *}"
@@ -187,6 +222,24 @@ bring_up() {
     fi
     echo "${name}: fresh session in ${WORKDIR}"
     launch "${where}" "${name}" "${WORKDIR}" "$(fresh_prompt "${name}")"
+}
+
+# An OpenCode member: resumes the OpenCode session its last beat names (OpenCode keeps no per-member
+# transcript the launcher can read, so it starts in CREW_WORKDIR), else starts fresh.
+bring_up_opencode() {
+    local name="$1" mode="$2" where="$3" beat sid
+    if [[ "${mode}" == resume ]]; then
+        beat="$(last_beat "${name}")"
+        sid="${beat%% *}"
+        if [[ -n "${sid}" && "$(beat_agent "${sid}")" == opencode ]]; then
+            echo "${name}: resuming OpenCode session ${sid} in ${WORKDIR}"
+            launch "${where}" "${name}" "${WORKDIR}" --session "${sid}" --prompt "$(resume_prompt "${name}")"
+            return 0
+        fi
+        echo "${name}: no earlier OpenCode session found, starting fresh"
+    fi
+    echo "${name}: fresh OpenCode session in ${WORKDIR}"
+    launch "${where}" "${name}" "${WORKDIR}" --prompt "$(fresh_prompt "${name}")"
 }
 
 list() {

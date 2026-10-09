@@ -23,3 +23,5 @@ jobs:
         run: claude plugin test .
       - name: Check the launcher's shell syntax
         run: bash -n bin/crew
+      - name: Run the OpenCode adapter's tests
+        run: node --experimental-strip-types --test hosts/opencode/beat.node-test.ts
