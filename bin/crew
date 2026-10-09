@@ -149,10 +149,15 @@ resume_prompt() {
     echo "You are $1. The crew launcher resumed this session. Read any messages that came in for you. ${BOARD_LINE}"
 }
 
-# The OpenCode config a member runs with: the crew plugin, the member's mesh key, its model.
+# The OpenCode config a member runs with: the crew plugin, its own macula server, its model. The macula entry
+# is complete: OpenCode drops an inline entry without a command and runs the global config's one instead, so
+# every member would share that config's identity. A complete entry replaces it, environment and all, and
+# MACULA_MCP_AGENT keys the server by the member's name (agent-<name>.key, created on first start), as for a
+# Claude member.
 opencode_config() {
-    jq -cn --arg plugin "file://${OPENCODE_PLUGIN}" --arg key "${KEYS}/agent-$1.key" --arg model "${CREW_OPENCODE_MODEL:-}" \
-        '{plugins: [$plugin], mcp: {macula: {environment: {MACULA_MCP_IDENTITY: $key}}}} + (if $model == "" then {} else {model: $model} end)'
+    jq -cn --arg plugin "file://${OPENCODE_PLUGIN}" --arg agent "$1" --arg pkg "${MACULA_MCP_PKG}" --arg model "${CREW_OPENCODE_MODEL:-}" \
+        '{plugins: [$plugin], mcp: {macula: {type: "local", command: ["npx", "-y", "-p", $pkg, "macula-mcp"], environment: {MACULA_MCP_AGENT: $agent}}}}
+         + (if $model == "" then {} else {model: $model} end)'
 }
 
 # The coding agent that wrote a session's beat: opencode, or claude for a beat that names none.
@@ -176,8 +181,7 @@ launch() {
         env -u MACULA_MCP_IDENTITY -u ANTHROPIC_API_KEY "CREW_NAME=${name}" "MACULA_MCP_AGENT=${agent}" claude --model "${model}" -n "${name}" "$@")
     if [[ "${AGENT}" == opencode ]]; then
         # --standalone: a private server, so the plugin runs in this member's process and reads its
-        # CREW_NAME. The member's mesh key goes through the config: OpenCode starts an MCP server
-        # with the environment its config names.
+        # CREW_NAME. The member's mesh server and its key go through the config (opencode_config).
         cmd=("${SHELL:-/usr/bin/zsh}" -ic 'exec "$@"' crew
             env -u MACULA_MCP_IDENTITY -u MACULA_MCP_AGENT -u ANTHROPIC_API_KEY "CREW_NAME=${name}" "CREW_SUPERVISOR=${SUPERVISOR}"
             "OPENCODE_CONFIG_CONTENT=$(opencode_config "${agent}")" opencode --standalone "$@")

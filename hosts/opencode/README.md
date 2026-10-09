@@ -19,8 +19,10 @@ CREW_AGENT=opencode CREW_OPENCODE_MODEL=deepseek/deepseek-flash crew <Name> --fr
 ```
 
 `bin/crew` runs `opencode --standalone` (a private server, so the plugin runs in that member's process and reads its
-`CREW_NAME`), loads this directory as a plugin and gives the member's mesh server its own key
-(`~/.config/macula-mcp/keys/agent-<name>.key`), all through `OPENCODE_CONFIG_CONTENT`. A resume reopens the OpenCode
+`CREW_NAME`), loads this directory as a plugin and gives the member its own macula server, the crew's macula-mcp
+release keyed by the member's name (`MACULA_MCP_AGENT`, so `~/.config/macula-mcp/keys/agent-<name>.key`), all through
+`OPENCODE_CONFIG_CONTENT`. That entry replaces any `macula` server in your global OpenCode config, so members never
+share its identity. A resume reopens the OpenCode
 session the member's last beat names (`--session`), in `CREW_WORKDIR`. The model is `CREW_OPENCODE_MODEL`
 (`provider/model`), else OpenCode's default; the crew plugin's Claude model settings do not apply.
 
