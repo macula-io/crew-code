@@ -21,6 +21,8 @@
 
 - Alerts: a session switching into needs-you rings the bell in its own kitty tab and shows a desktop notification ("<Name>: <what waits>"), once per switch; `/crew-sound on | off | bell | notify` mutes either or both for the whole crew (#15).
 
+- The factory ledger: append-only JSON lines per session per ISO week under `~/.claude/crew/ledger/`. The mod logs owner waits, menus, cards and refreshes with the cost and weekly gauge at that moment; `crew_log` records package milestones (supervisor: assigned to closed; members: checkpoint, release, fix after shipping, Fable round). `/crew-report [week]` sums cycle time, owner wait, rework, releases and cost per package, cost per member, and gauge points per release (#16).
+
 ### Fixed
 - A finished task no longer shows "refresh due after this turn" when that refresh will not run (refresh off, or context under the threshold). The check is made when the task finishes, the same one the turn's end makes (#5).
 - A background subagent that ends while its session is idle leaves the dashboard's "waiting on" list at the next beat, so an idle member with nothing live shows idle without a new turn. A subagent's Stop hook also refreshes the list, since it carries the session's background work. Otherwise background shells clear at the next turn's end: the plugin API has no live read of them (#5).

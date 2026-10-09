@@ -56,6 +56,7 @@ Change them with `/config` or under `pluginConfigs.crew.options` in `~/.claude/s
 | `/crew-park [off]` | Parks this session: wake-on-idle never wakes it and the dashboard shows it parked. `off` unparks it. The owner's manual override: members park themselves with `crew_park`. |
 | `/crew-progress on \| off` | Turns progress reporting on or off for this session. |
 | `/crew-sound on \| off \| bell \| notify` | When a session starts waiting on the owner, its kitty tab rings its bell (kitty marks the tab) and a desktop notification names it and what waits: once per switch, never repeated while it waits. `bell` or `notify` keeps one of the two, `off` mutes both, for the whole crew. |
+| `/crew-report [YYYY-Www]` | The crew ledger for a week (default this one): per work package its cycle time, owner wait, rework, releases and cost; per member its cost; weekly-gauge points per release. |
 | `/crew-budget [fable <percent> \| fable off]` | Shows the budget gauges, or sets the Fable one, which Claude Code does not report. |
 
 Sessions also get three tools: `report_progress` for the progress bar; `crew_park` (`parked` 1 or 0, and a `reason`), which a member calls itself when the supervisor or the owner tells it to stop or to resume; and `crew_refresh` (a `reason`), which a member calls when told to refresh. It runs the same flow as `/crew-refresh now` (safety check, handover, clear, resume) whatever the member's refresh mode, and leaves that mode as it was.
@@ -63,6 +64,10 @@ Sessions also get three tools: `report_progress` for the progress bar; `crew_par
 ## Asks for the owner
 
 One menu per change: every session's prompt says to put everything one change needs from the owner (the code range, the tag, the fleet commit, in the order they run) in ONE yes/no ask. A routine ask that is not part of a change (a cleanup, a branch or worktree to delete) goes to the `queue_ask` tool instead of a menu of its own; the dashboard header shows how many wait (`3 asks waiting`), and the supervisor, at a natural pause, calls `take_asks` and offers them all in one multi-select menu. Queued asks are files under `~/.claude/crew/asks/`, one per ask.
+
+## The factory ledger
+
+Every session appends to `~/.claude/crew/ledger/<ISO week>/<session>.jsonl`, one JSON line per event, each with the member's name, its session cost and the weekly gauge at that moment. The mod logs what it sees: how long the owner was waited on (needs-you intervals), menus shown, cards claimed and finished, refreshes. The `crew_log` tool (`package`, `event`, `note`) records what only the crew knows: the supervisor logs `assigned`, `ask_sent`, `owner_yes`, `sent_back`, `live`, `closed`; members log `checkpoint`, `release`, `fix_after_ship`, `fable_round`. `/crew-report` sums a week.
 
 ## What the dashboard tells you
 

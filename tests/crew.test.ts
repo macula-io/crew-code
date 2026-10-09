@@ -64,7 +64,8 @@ test('report_progress answers the model and records the step', async ($, on) => 
 const sessionMocks = (on: any, store: Map<string, unknown>, onWrite: (text: string) => void = () => {}) => {
   mock.env(on, { HOME: '/home/test' })
   on('fs.exists', () => ({ value: false }))
-  on('fs.write', (_$: unknown, e: { text: string }) => { onWrite(e.text); return { value: undefined } })
+  // Only beat files reach onWrite: the ledger's JSON lines are not beats.
+  on('fs.write', (_$: unknown, e: { path: string; text: string }) => { if (!e.path.includes('/ledger/')) onWrite(e.text); return { value: undefined } })
   on('session.id', () => ({ value: 'id-fovea' }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000, percent: 55 }, rateLimits: [] } }))
   on('session.repo', () => ({ value: null }))

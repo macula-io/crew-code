@@ -187,6 +187,87 @@ const alertOwner = async ($: EngineInterface, beat: CrewBeat) => {
     await $.process.run(['notify-send', '-a', 'crew', beat.name, beat.lastLine || `${beat.lastTool || 'something'} waits on you`]).catch(() => null)
   }
 }
+// The factory ledger (#16): append-only JSON lines, one file per session per ISO week, under the crew
+// directory's ledger/<week>/, so sessions never write the same file. A plain log, not event sourcing.
+// The mod logs what it sees (owner waits, menus, cards, refreshes); crew_log records the milestones only
+// the crew knows. /crew-report sums a week.
+const LOG_TOOL = 'mcp__crew__crew_log'
+const SUPERVISOR_EVENTS = ['assigned', 'ask_sent', 'owner_yes', 'sent_back', 'live', 'closed']
+const MEMBER_EVENTS = ['checkpoint', 'release', 'fix_after_ship', 'fable_round']
+const LOG_EVENTS = [...SUPERVISOR_EVENTS, ...MEMBER_EVENTS]
+const isoWeek = (at: number) => {
+  const day = new Date(at)
+  const date = new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate()))
+  const weekday = date.getUTCDay() || 7
+  date.setUTCDate(date.getUTCDate() + 4 - weekday)
+  const yearStart = Date.UTC(date.getUTCFullYear(), 0, 1)
+  const week = Math.ceil(((date.getTime() - yearStart) / 86_400_000 + 1) / 7)
+
+  return `${date.getUTCFullYear()}-W${String(week).padStart(2, '0')}`
+}
+type LedgerEvent = { event: string; name: string; at: number; package?: string; note?: string; cost: number | null; weekly: number | null; ms?: number; from?: number }
+const logEvent = async ($: EngineInterface, entry: { event: string; package?: string; note?: string; ms?: number; from?: number }) => {
+  const at = await $.clock.now()
+  const usage = await $.session.usage()
+  const line: LedgerEvent = {
+    ...entry,
+    name: await currentName($),
+    at,
+    cost: usage.cost?.usd ?? null,
+    weekly: weeklyOf(usage.rateLimits)?.percent ?? null,
+  }
+  const path = `${await crewDir($)}/ledger/${isoWeek(at)}/${await $.session.id()}.jsonl`
+  const before = await $.fs.read(path).catch(() => '')
+  await $.fs.write(path, `${before}${JSON.stringify(line)}\n`)
+}
+const packageOf = async ($: EngineInterface) => {
+  const held = await $.store.get(`package:${await currentName($)}`).catch(() => undefined)
+  return typeof held === 'string' && held ? held : undefined
+}
+// When this session's row went into needs-you, so the wait is logged when it comes out.
+let needsSince: number | null = null
+
+const costByName = (events: LedgerEvent[]) => {
+  const byName = new Map<string, number[]>()
+  events.forEach(event => {
+    if (typeof event.cost === 'number') byName.set(event.name, [...(byName.get(event.name) ?? []), event.cost])
+  })
+  return new Map([...byName].map(([name, costs]) => [name, Math.max(...costs) - Math.min(...costs)]))
+}
+const sumOf = (values: Iterable<number>) => [...values].reduce((sum, value) => sum + value, 0)
+
+const reportOf = (week: string, events: LedgerEvent[]) => {
+  if (events.length === 0) return `No ledger for ${week} yet.`
+  const packages = [...new Set(events.map(event => event.package).filter((ref): ref is string => Boolean(ref)))]
+  const lines = packages.map(ref => {
+    const of = events.filter(event => event.package === ref)
+    const times = of.map(event => event.at)
+    const wait = sumOf(of.filter(event => event.event === 'owner_wait').map(event => event.ms ?? 0))
+    const rework = of.filter(event => event.event === 'sent_back' || event.event === 'fix_after_ship').length
+    const releases = of.filter(event => event.event === 'release').length
+    const cost = sumOf(costByName(of).values())
+    return `- ${ref}: cycle ${span(Math.max(...times) - Math.min(...times))} · owner wait ${wait > 0 ? span(wait) : '0m'} · rework ${rework} · releases ${releases} · cost $${cost.toFixed(2)}`
+  })
+  const members = [...costByName(events)].sort((a, b) => b[1] - a[1]).map(([name, cost]) => `${name} $${cost.toFixed(2)}`)
+  const gauges = events.map(event => event.weekly).filter((value): value is number => typeof value === 'number')
+  const releases = events.filter(event => event.event === 'release').length
+  const points = gauges.length > 0 ? Math.max(...gauges) - Math.min(...gauges) : 0
+  const perRelease = releases > 0 ? ` · ${(points / releases).toFixed(1)} gauge points per release` : ''
+
+  return [
+    `Crew ledger ${week}: ${packages.length} ${packages.length === 1 ? 'package' : 'packages'}, ${releases} ${releases === 1 ? 'release' : 'releases'}, weekly gauge ${gauges.length ? `${Math.min(...gauges)}% → ${Math.max(...gauges)}%` : 'not read'}${perRelease}`,
+    ...lines,
+    `members: ${members.join(' · ') || 'no cost read'}`,
+  ].join('\n')
+}
+
+const ledgerRulePrompt = (isSupervisor: boolean) =>
+  `Crew ledger: log with crew_log (package, event, note) ` +
+  (isSupervisor
+    ? `each work package's milestones as they happen: ${SUPERVISOR_EVENTS.join(', ')}.`
+    : `your own milestones on a package: ${MEMBER_EVENTS.join(', ')} (a release you shipped, a fix after shipping, a Fable round).`) +
+  ' The crew mod logs owner waits, menus, cards and refreshes itself.'
+
 // How long after a refresh its row shows the context it dropped from.
 const REFRESHED_SHOWN_MS = 30 * 60_000
 const isParkedOf = async ($: EngineInterface, name: string) => (await $.store.get(`park:${name}`)) === 1
@@ -435,6 +516,7 @@ const advanceRefresh = async ($: EngineInterface, answer: string) => {
   if (written.mtimeMs < flow.requestedAt) return abandonRefresh($, `handover not written to ${flow.path}`)
   await update($, refreshFlow, all => ({ ...all, phase: 'clearing' as const }))
   const fromPercent = await contextPercent($)
+  await logEvent($, { event: 'refresh', package: await packageOf($), from: fromPercent })
   const card = await $.store.get(`card:${flow.name}`)
   const brief = await briefOf($, flow.name)
   // Out of the turn's hook: /clear cannot run inside a hook the turn waits on.
@@ -630,7 +712,15 @@ const writeBeat = async ($: EngineInterface, change: Partial<CrewBeat>) => {
   }
   await update($, me, () => beat)
   await $.fs.write(`${await crewDir($)}/${sessionId}.json`, JSON.stringify(beat))
-  if (beat.state === 'needs-you' && carried?.state !== 'needs-you') await alertOwner($, beat)
+  if (beat.state === 'needs-you' && carried?.state !== 'needs-you') {
+    needsSince = beat.beatAt
+    await alertOwner($, beat)
+  }
+  if (beat.state !== 'needs-you' && carried?.state === 'needs-you' && needsSince !== null) {
+    const ms = beat.beatAt - needsSince
+    needsSince = null
+    await logEvent($, { event: 'owner_wait', package: await packageOf($), ms })
+  }
 }
 
 const loadBeats = async ($: EngineInterface) => {
@@ -709,6 +799,7 @@ export const register: Register = (on, options) => {
     await $.command.register({ name: 'crew-refresh', description: 'Refresh this session from a handover: after a task, at a package boundary, or now', argumentHint: 'auto|package [all]|on [percent]|off|now' })
     await $.command.register({ name: 'crew-goal', description: "Show the crew's goal, or set it: /crew-goal <package refs> <sentence>", argumentHint: '[org/repo#n [org/repo#m]] [sentence]' })
     await $.command.register({ name: 'crew-park', description: 'Park this session so wake-on-idle leaves it alone: /crew-park, and /crew-park off', argumentHint: 'off' })
+    await $.command.register({ name: 'crew-report', description: "The crew ledger for a week: per package cost, cycle time, owner wait and rework", argumentHint: '[YYYY-Www]' })
     await $.command.register({ name: 'crew-sound', description: 'Bell and desktop notification when a session starts waiting on you: /crew-sound off mutes', argumentHint: 'on|off|bell|notify' })
     await $.command.register({ name: 'crew-budget', description: 'Show the budget gauges, or set the Fable one: /crew-budget fable 56', argumentHint: 'fable <percent>|fable off' })
     await $.command.register({ name: 'crew-progress', description: 'Turn progress reporting on or off for this session: /crew-progress off', argumentHint: 'on|off' })
@@ -762,6 +853,21 @@ export const register: Register = (on, options) => {
         type: 'object',
         properties: { ask: { type: 'string', description: 'The question, answerable yes or no, naming exactly what would be done' } },
         required: ['ask'],
+      },
+    })
+    await $.tool.register({
+      name: 'crew_log',
+      description:
+        `Log a work package milestone in the crew's ledger, which ${OWNER} reads to tune the crew for cost and speed. ` +
+        `The ${SUPERVISOR} logs ${SUPERVISOR_EVENTS.join(', ')}; members log ${MEMBER_EVENTS.join(', ')}.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          package: { type: 'string', description: 'The work package, org/repo#n' },
+          event: { type: 'string', enum: LOG_EVENTS, description: 'What happened' },
+          note: { type: 'string', description: 'One short line: the range, the release, why it was sent back' },
+        },
+        required: ['package', 'event'],
       },
     })
     await $.tool.register({
@@ -834,7 +940,10 @@ export const register: Register = (on, options) => {
   on('tool.call', async ($, e, next) => {
     const tool = String(e.tool).replace(/^mcp__/, '')
     const isSubagent = e.agentId !== undefined
-    if (e.tool === 'AskUserQuestion') await writeBeat($, { state: 'needs-you', lastTool: tool, lastLine: 'answer the question menu' })
+    if (e.tool === 'AskUserQuestion') {
+      await logEvent($, { event: 'menu', package: await packageOf($) })
+      await writeBeat($, { state: 'needs-you', lastTool: tool, lastLine: 'answer the question menu' })
+    }
     else if (!isSubagent) await writeBeat($, { state: 'working', lastTool: tool })
     const ran = await next(e)
     const dialog = openDialog
@@ -1026,7 +1135,9 @@ export const register: Register = (on, options) => {
       ...(isSupervisor ? [{ id: 'crew:ask-queue', text: takeAsksPrompt(), scope: 'session' as const }] : []),
     ]
 
-    return { ...composed, sections: [...composed.sections, ...board, ...progress, ...refresh, ...briefs, ...asks, ...budget] }
+    const ledger = [{ id: 'crew:ledger', text: ledgerRulePrompt(isSupervisor), scope: 'session' as const }]
+
+    return { ...composed, sections: [...composed.sections, ...board, ...progress, ...refresh, ...briefs, ...asks, ...budget, ...ledger] }
   })
 
   // The board is the card boundary: a claim at or above the claim limit is refused and turns
@@ -1056,10 +1167,15 @@ export const register: Register = (on, options) => {
       // By name, so the fresh session after a refresh is pointed at the card it holds.
       if (claimed.issueRef) await $.store.set(`card:${await currentName($)}`, claimed.issueRef)
       await writeBeat($, {})
-      if (await crossesPackage($, claimed.workPackage, percent)) return withNote(ran, PACKAGE_HANDOVER_NOTE)
+      const crosses = await crossesPackage($, claimed.workPackage, percent)
+      await logEvent($, { event: 'card_claimed', package: claimed.workPackage || undefined, note: claimed.issueRef })
+      if (crosses) return withNote(ran, PACKAGE_HANDOVER_NOTE)
     }
     if (procedure === 'mcl-kanban/finish_card' || procedure === 'mcl-kanban/release_card') await $.store.delete(`card:${await currentName($)}`)
-    if (procedure === 'mcl-kanban/finish_card') await logCardUsage($, String(call.args?.card_id ?? ''), percent)
+    if (procedure === 'mcl-kanban/finish_card') {
+      await logEvent($, { event: 'card_finished', package: await packageOf($), note: (await read($, cardStart))?.issueRef ?? '' })
+      await logCardUsage($, String(call.args?.card_id ?? ''), percent)
+    }
 
     return ran
   })
@@ -1089,6 +1205,33 @@ export const register: Register = (on, options) => {
     await setParked($, name, isParked)
 
     return { result: isParked ? `${name} is parked (${reason}): wake-on-idle no longer wakes it. End your turn.` : `${name} is unparked (${reason}): wake-on-idle wakes it again to work the board.` }
+  })
+
+  on('tool.call', { tool: LOG_TOOL }, async ($, e) => {
+    const input = e as unknown as { package?: unknown; event?: unknown; note?: unknown }
+    const event = String(input.event ?? '')
+    const ref = String(input.package ?? '').trim()
+    if (!LOG_EVENTS.includes(event)) return { result: `Not logged: event must be one of ${LOG_EVENTS.join(', ')}.` }
+    if (!PACKAGE_REF.test(ref)) return { result: 'Not logged: package must be a work package ref, org/repo#n.' }
+    await logEvent($, { event, package: ref, note: String(input.note ?? '').slice(0, 200) })
+
+    return { result: `${event} logged for ${ref}.` }
+  })
+
+  on('command.run', { command: 'crew-report' }, async ($, e) => {
+    const week = e.args.trim() || isoWeek(await $.clock.now())
+    if (!/^\d{4}-W\d{2}$/.test(week)) return { text: 'Usage: /crew-report [YYYY-Www], the ISO week (default this one).' }
+    const dir = `${await crewDir($)}/ledger/${week}`
+    const files = (await $.fs.list(dir).catch(() => [])).filter(entry => entry.name.endsWith('.jsonl'))
+    const texts = await Promise.all(files.map(entry => $.fs.read(`${dir}/${entry.name}`).catch(() => '')))
+    const events = texts
+      .flatMap(text => text.split('\n'))
+      .filter(Boolean)
+      .map(line => { try { return JSON.parse(line) as LedgerEvent } catch { return null } })
+      .filter((event): event is LedgerEvent => event !== null)
+      .sort((a, b) => a.at - b.at)
+
+    return { text: reportOf(week, events) }
   })
 
   on('tool.call', { tool: QUEUE_TOOL }, async ($, e) => {
