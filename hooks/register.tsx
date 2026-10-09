@@ -872,6 +872,31 @@ const writeBeat = async ($: EngineInterface, change: Partial<CrewBeat>) => {
   }
 }
 
+// The beats directory also holds other crew files (roster.json, room.json): only a named, timed record is a beat.
+// A beat from another host or an older mod can lack fields, so every one the pane reads gets a default.
+const beatOf = (raw: unknown): CrewBeat | null => {
+  const beat = raw as Partial<CrewBeat> | null
+  if (!beat || typeof beat.name !== 'string' || beat.name === '' || typeof beat.beatAt !== 'number') return null
+  return {
+    ...beat,
+    sessionId: beat.sessionId ?? '',
+    name: beat.name,
+    state: beat.state ?? 'idle',
+    repo: beat.repo ?? '',
+    model: beat.model ?? '',
+    turns: beat.turns ?? 0,
+    contextPercent: beat.contextPercent ?? null,
+    costUsd: beat.costUsd ?? null,
+    fiveHourPercent: beat.fiveHourPercent ?? null,
+    lastTool: beat.lastTool ?? '',
+    lastLine: beat.lastLine ?? '',
+    progress: beat.progress ?? null,
+    refresh: beat.refresh ?? null,
+    startedAt: beat.startedAt ?? beat.beatAt,
+    beatAt: beat.beatAt,
+  }
+}
+
 const loadBeats = async ($: EngineInterface) => {
   const dir = await crewDir($)
   const entries = (await $.fs.exists(dir)) ? await $.fs.list(dir) : []
@@ -881,10 +906,10 @@ const loadBeats = async ($: EngineInterface) => {
       .filter(entry => entry.name.endsWith('.json'))
       .map(entry => {
         const path = `${dir}/${entry.name}`
-        return $.fs.read(path).then(text => ({ path, beat: JSON.parse(text) as CrewBeat })).catch(() => null)
+        return $.fs.read(path).then(text => ({ path, beat: beatOf(JSON.parse(text)) })).catch(() => null)
       }),
   )
-  const held = parsed.filter((entry): entry is { path: string; beat: CrewBeat } => entry !== null)
+  const held = parsed.filter((entry): entry is { path: string; beat: CrewBeat } => entry !== null && entry.beat !== null)
   // Nothing else deletes these, so without this one file per session ever started piles up.
   const swept = held.filter(entry => now - entry.beat.beatAt > SWEEP_AFTER_MS).map(entry => entry.path)
   if (swept.length > 0) await $.process.run(['rm', '-f', ...swept]).catch(() => null)
