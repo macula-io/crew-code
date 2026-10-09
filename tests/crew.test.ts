@@ -447,7 +447,11 @@ const crewSession = (on: any, store: Map<string, unknown>, context: { percent: n
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.turns', () => ({ value: 1 }))
   on('session.messages', () => ({ value: [] }))
-  on('process.run', () => ({ value: { exitCode: 0, stdout: '2026-10-06\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  // `rm -f <paths>` removes files this session holds; anything else answers with today's date.
+  on('process.run', (_$: unknown, e: { argv: string[] }) => {
+    if (e.argv[0] === 'rm') e.argv.slice(2).forEach(path => files.delete(path))
+    return { value: { exitCode: 0, stdout: '2026-10-06\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
   on('store.get', (_$: unknown, e: { key: string }) => ({ value: store.get(e.key) }))
   on('store.set', (_$: unknown, e: { key: string; value: unknown }) => { store.set(e.key, e.value); return { value: undefined } })
   on('store.delete', (_$: unknown, e: { key: string }) => { store.delete(e.key); return { value: undefined } })
@@ -1153,19 +1157,14 @@ test('take_asks hands over every queued ask, oldest first, and empties the queue
   const store = new Map<string, unknown>([['name:id-crew', 'Supervisor']])
   mock.clock(on, { now: NOW })
   const { files } = crewSession(on, store, { percent: 30 })
-  const removed: string[] = []
   files.set(`${ASKS_DIR}/2000-b.json`, JSON.stringify({ from: 'Venus', ask: 'Delete branch venus/x?', at: 2000 }))
   files.set(`${ASKS_DIR}/1000-a.json`, JSON.stringify({ from: 'Mars', ask: 'Remove worktree mars-y?', at: 1000 }))
-  on('process.run', (_$: unknown, e: { argv: string[] }) => {
-    if (e.argv[0] === 'rm') e.argv.slice(2).forEach(path => { removed.push(path); files.delete(path) })
-    return { value: { exitCode: 0, stdout: '2026-10-06\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-  })
 
   const ran = String(((await $.tool.call({ tool: 'mcp__crew__take_asks' } as never)) as { result?: unknown }).result)
 
   expect(ran.indexOf('Mars: Remove worktree mars-y?')).toBeLessThan(ran.indexOf('Venus: Delete branch venus/x?'))
   expect(ran).toContain('multiSelect')
-  expect(removed.sort()).toEqual([`${ASKS_DIR}/1000-a.json`, `${ASKS_DIR}/2000-b.json`])
+  expect([...files.keys()].filter(path => path.startsWith(`${ASKS_DIR}/`))).toEqual([])
 })
 
 test('the dashboard header says how many asks wait for the owner', async ($, on) => {

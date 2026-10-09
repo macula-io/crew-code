@@ -58,6 +58,10 @@ Change them with `/config` or under `pluginConfigs.crew.options` in `~/.claude/s
 
 Sessions also get three tools: `report_progress` for the progress bar; `crew_park` (`parked` 1 or 0, and a `reason`), which a member calls itself when the supervisor or the owner tells it to stop or to resume; and `crew_refresh` (a `reason`), which a member calls when told to refresh. It runs the same flow as `/crew-refresh now` (safety check, handover, clear, resume) whatever the member's refresh mode, and leaves that mode as it was.
 
+## Asks for the owner
+
+One menu per change: every session's prompt says to put everything one change needs from the owner (the code range, the tag, the fleet commit, in the order they run) in ONE yes/no ask. A routine ask that is not part of a change (a cleanup, a branch or worktree to delete) goes to the `queue_ask` tool instead of a menu of its own; the dashboard header shows how many wait (`3 asks waiting`), and the supervisor, at a natural pause, calls `take_asks` and offers them all in one multi-select menu. Queued asks are files under `~/.claude/crew/asks/`, one per ask.
+
 ## What the dashboard tells you
 
 - **Needs you**, at the top: every session waiting on the owner, by the kitty tab to click and what it waits on. A question menu, a permission dialog, an MCP server asking for input, an engine notification and a turn that ends on a question all count.

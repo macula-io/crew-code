@@ -127,6 +127,18 @@ const PARK_TOOL = 'mcp__crew__crew_park'
 // A member told to refresh calls crew_refresh: the forced flow of /crew-refresh now, whatever its mode,
 // which stays as it was. A handover a member writes on its own is invisible here and clears nothing.
 const REFRESH_TOOL = 'mcp__crew__crew_refresh'
+// Routine asks for the owner wait in a queue, one file per ask under the crew directory (so sessions
+// never race on one file), until the Supervisor offers them together in one multi-select menu.
+const QUEUE_TOOL = 'mcp__crew__queue_ask'
+const TAKE_TOOL = 'mcp__crew__take_asks'
+const asksDir = async ($: EngineInterface) => `${await crewDir($)}/asks`
+const askFilesOf = async ($: EngineInterface) => {
+  const dir = await asksDir($)
+  const entries = await $.fs.list(dir).catch(() => [])
+
+  return entries.map(entry => entry.name).filter(name => name.endsWith('.json')).sort().map(name => `${dir}/${name}`)
+}
+const queued = atom({ plugin: 'crew', key: 'asks' } as const, 0)
 // How long after a refresh its row shows the context it dropped from.
 const REFRESHED_SHOWN_MS = 30 * 60_000
 const isParkedOf = async ($: EngineInterface, name: string) => (await $.store.get(`park:${name}`)) === 1
@@ -195,6 +207,15 @@ const refreshRulePrompt = () =>
   `Crew refresh: when the ${SUPERVISOR} or ${OWNER} tells you to refresh, call crew_refresh with the reason and end your turn; ` +
   'the crew mod then asks you for your handover, clears this session and resumes it. Never write a handover on your own instead: ' +
   'the mod does not see it and nothing is cleared.'
+
+const asksRulePrompt = () =>
+  `Crew asks: one menu per change. Put everything one change needs from ${OWNER} (the code range, the tag, the fleet commit, ` +
+  'in the order they run) in ONE yes/no ask. A routine ask that still needs an answer and is not part of a change ' +
+  '(a cleanup, a branch or worktree to delete) goes to queue_ask, never into a menu of its own.'
+
+const takeAsksPrompt = () =>
+  `Crew ask queue: the dashboard shows how many routine asks wait. At a natural pause, when no other menu is open, call take_asks ` +
+  `and offer what it returns to ${OWNER} as ONE AskUserQuestion with multiSelect, then act on, or relay, each answer.`
 
 const briefRulePrompt = () =>
   'Crew briefs: when you assign work to a member, also write the brief to ~/.claude/sessions/BRIEF_<YYYY-MM-DD>_<Name>.md ' +
@@ -594,6 +615,8 @@ const loadBeats = async ($: EngineInterface) => {
     return at < 0 ? ROSTER.length : at
   }
   await update($, beats, () => [...byName.values()].sort((a, b) => order(a) - order(b)))
+  const waiting = (await askFilesOf($)).length
+  await update($, queued, () => waiting)
 }
 
 const ago = (now: number, at: number) => {
@@ -677,6 +700,22 @@ export const register: Register = (on, options) => {
         properties: { reason: { type: 'string', description: 'Who told you to refresh, and why, in one line' } },
         required: ['reason'],
       },
+    })
+    await $.tool.register({
+      name: 'queue_ask',
+      description:
+        `Queue a routine yes/no ask for ${OWNER} instead of opening a menu for it: a cleanup, a branch or worktree to delete. ` +
+        `The ${SUPERVISOR} offers queued asks together. Never queue part of a change: a change's asks go in one menu.`,
+      inputSchema: {
+        type: 'object',
+        properties: { ask: { type: 'string', description: 'The question, answerable yes or no, naming exactly what would be done' } },
+        required: ['ask'],
+      },
+    })
+    await $.tool.register({
+      name: 'take_asks',
+      description: `Take every queued routine ask, oldest first, to offer them to ${OWNER} in one multi-select menu. The queue is emptied.`,
+      inputSchema: { type: 'object', properties: {} },
     })
     await writeBeat($, { state: 'idle' })
     $.clock.every(BEAT_MS, () => void writeBeat($, {}))
@@ -899,9 +938,14 @@ export const register: Register = (on, options) => {
     const isOff = (await $.store.get(`progress-off:${await $.session.id()}`)) === 1
     const progress = isOff ? [] : [{ id: 'crew:progress', text: progressPrompt(), scope: 'session' as const }]
     const refresh = [{ id: 'crew:refresh', text: refreshRulePrompt(), scope: 'session' as const }]
-    const briefs = (await currentName($)) === SUPERVISOR ? [{ id: 'crew:briefs', text: briefRulePrompt(), scope: 'session' as const }] : []
+    const isSupervisor = (await currentName($)) === SUPERVISOR
+    const briefs = isSupervisor ? [{ id: 'crew:briefs', text: briefRulePrompt(), scope: 'session' as const }] : []
+    const asks = [
+      { id: 'crew:asks', text: asksRulePrompt(), scope: 'session' as const },
+      ...(isSupervisor ? [{ id: 'crew:ask-queue', text: takeAsksPrompt(), scope: 'session' as const }] : []),
+    ]
 
-    return { ...composed, sections: [...composed.sections, ...board, ...progress, ...refresh, ...briefs] }
+    return { ...composed, sections: [...composed.sections, ...board, ...progress, ...refresh, ...briefs, ...asks] }
   })
 
   // The board is the card boundary: a claim at or above the claim limit is refused and turns
@@ -964,6 +1008,35 @@ export const register: Register = (on, options) => {
     await setParked($, name, isParked)
 
     return { result: isParked ? `${name} is parked (${reason}): wake-on-idle no longer wakes it. End your turn.` : `${name} is unparked (${reason}): wake-on-idle wakes it again to work the board.` }
+  })
+
+  on('tool.call', { tool: QUEUE_TOOL }, async ($, e) => {
+    const ask = String((e as unknown as { ask?: unknown }).ask ?? '').trim().slice(0, 300)
+    if (ask === '') return { result: 'Nothing queued: the ask is empty.' }
+    const at = await $.clock.now()
+    const id = `${String(at).padStart(15, '0')}-${(await $.session.id()).slice(0, 8)}-${Math.random().toString(36).slice(2, 8)}`
+    await $.fs.write(`${await asksDir($)}/${id}.json`, JSON.stringify({ from: await currentName($), ask, at }))
+    const waiting = (await askFilesOf($)).length
+    await update($, queued, () => waiting)
+
+    return { result: `Queued for ${OWNER}; ${waiting} ${waiting === 1 ? 'ask' : 'asks'} waiting. Do not open a menu for it; carry on.` }
+  })
+
+  on('tool.call', { tool: TAKE_TOOL }, async ($) => {
+    const paths = await askFilesOf($)
+    const asks = (await Promise.all(paths.map(path => $.fs.read(path).then(text => JSON.parse(text) as { from: string; ask: string; at: number }).catch(() => null))))
+      .filter((ask): ask is { from: string; ask: string; at: number } => ask !== null)
+      .sort((a, b) => a.at - b.at)
+    if (paths.length > 0) await $.process.run(['rm', '-f', ...paths]).catch(() => null)
+    await update($, queued, () => 0)
+    if (asks.length === 0) return { result: 'No asks are queued.' }
+
+    return {
+      result: [
+        `${asks.length} queued ${asks.length === 1 ? 'ask' : 'asks'}, oldest first. Offer them to ${OWNER} as ONE AskUserQuestion with multiSelect (at most 4 options a question; split into questions of the same menu when there are more), then act on or relay each answer:`,
+        ...asks.map(ask => `- ${ask.from}: ${ask.ask}`),
+      ].join('\n'),
+    }
   })
 
   on('tool.call', { tool: REFRESH_TOOL }, async ($, e) => {
@@ -1053,6 +1126,7 @@ export const register: Register = (on, options) => {
     const lineWidth = Math.max(10, width - 2)
     const { goal, error } = await read($, goalView)
     const needy = list.filter(beat => beat.state === 'needs-you')
+    const waitingAsks = await read($, queued)
 
     return (
       <Box flexDirection="column">
@@ -1066,7 +1140,7 @@ export const register: Register = (on, options) => {
         )}
         <Box flexDirection="row" justifyContent="space-between">
           <Text bold>
-            {online.length}/{list.length} online · ${total.toFixed(2)} spent · 5h window {fiveHour.toFixed(0)}%
+            {`${online.length}/${list.length} online · $${total.toFixed(2)} spent · 5h window ${fiveHour.toFixed(0)}%`}{waitingAsks > 0 ? <Text color="yellow">{` · ${waitingAsks} ${waitingAsks === 1 ? 'ask' : 'asks'} waiting`}</Text> : null}
           </Text>
           <Button key="close" label="close" hotkey="x" role="dismiss" onPress={() => $.ui.close({ id: PANE })} />
         </Box>

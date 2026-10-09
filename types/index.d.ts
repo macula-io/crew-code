@@ -71,6 +71,8 @@ declare module 'claude-code' {
       boardEmptyAt: number
       cardStart: CrewCardStart | null
       goal: CrewGoalView
+      // Routine asks queued for the owner (files under the crew directory's asks/), as last counted.
+      asks: number
     }
   }
 }
