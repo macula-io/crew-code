@@ -284,7 +284,7 @@ test('a background agent that ends while the session is idle leaves the row idle
   await clock.advance(20_000)
   expect(written.at(-1)).toMatchObject({ state: 'waiting', waitingOn: 'Explore: review the diff' })
 
-  agents[0].status = 'completed'
+  agents[0]!.status = 'completed'
   await clock.advance(20_000)
   expect(written.at(-1)).toMatchObject({ state: 'idle', waitingOn: '' })
 })
@@ -434,7 +434,10 @@ const crewSession = (on: any, store: Map<string, unknown>, context: { percent: n
   on('fs.exists', (_$: unknown, e: { path: string }) => ({ value: files.has(e.path) }))
   on('fs.read', (_$: unknown, e: { path: string }) => ({ value: files.get(e.path) ?? '' }))
   on('fs.write', (_$: unknown, e: { path: string; text: string }) => { files.set(e.path, e.text); return { value: undefined } })
-  on('fs.list', () => ({ value: [] }))
+  // A directory lists the files this session holds under it.
+  on('fs.list', (_$: unknown, e: { path: string }) => ({
+    value: [...files.keys()].filter(path => path.startsWith(`${e.path}/`)).map(path => ({ name: path.slice(e.path.length + 1), kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })),
+  }))
   on('fs.stat', () => ({ value: { kind: 'file', size: 10, mtimeMs: Date.now() + 60_000, isLink: false } }))
   on('session.id', () => ({ value: 'id-crew' }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000, percent: context.percent }, rateLimits: [] } }))
@@ -1093,9 +1096,6 @@ test('the resume prompt points at the card the member holds and its newest brief
   files.set('/home/test/.claude/sessions/BRIEF_2026-10-05_Mars.md', 'old brief')
   files.set('/home/test/.claude/sessions/BRIEF_2026-10-06_Mars.md', 'the brief')
   files.set('/home/test/.claude/sessions/BRIEF_2026-10-06_Venus.md', 'not mine')
-  on('fs.list', (_$: unknown, e: { path: string }) => ({
-    value: [...files.keys()].filter(path => path.startsWith(`${e.path}/`)).map(path => ({ name: path.split('/').at(-1), kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })),
-  }))
 
   await $.turn.start({ text: 'go', turnId: 't1' })
   await $.tool.call(claimNext)

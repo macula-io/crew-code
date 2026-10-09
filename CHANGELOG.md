@@ -10,6 +10,11 @@
 - A marketplace file: `/plugin install crew --marketplace macula-io/crew-code`.
 - Parking: a parked member is never woken on idle (nor handed over for a wake), and the dashboard shows it parked. A member parks itself with the `crew_park` tool (`parked` 1 or 0, and a reason) when told to stop or wind down, and unparks when told to resume; `/crew-park` and `/crew-park off` are the owner's manual override. A wake-up that finds an earlier stop parks the member and ends the turn. The board rules tell members to name every container or process they start after themselves and stop only those (#3).
 
+- Refresh on request in any mode: the `crew_refresh` tool runs the `/crew-refresh now` flow when the supervisor or the owner tells a member to refresh, and leaves its refresh mode unchanged. Every session's prompt says to call it rather than write a handover by hand (#12).
+- An honest "needs you" list at the top of the dashboard: each session waiting on the owner, by tab, with what it waits on. MCP elicitations and engine notifications now count, next to question menus, permission dialogs and closing questions; a waiting row always names what it waits on (#12).
+- After a refresh the row shows the context drop for half an hour (`refreshed 53% → 4%`) (#12).
+- Assignments survive a refresh: the resume prompt points at the card the member holds and its newest `BRIEF_<date>_<Name>.md`, which the supervisor's prompt tells it to write with each assignment (#12).
+
 ### Fixed
 - A finished task no longer shows "refresh due after this turn" when that refresh will not run (refresh off, or context under the threshold). The check is made when the task finishes, the same one the turn's end makes (#5).
 - A background subagent that ends while its session is idle leaves the dashboard's "waiting on" list at the next beat, so an idle member with nothing live shows idle without a new turn. A subagent's Stop hook also refreshes the list, since it carries the session's background work. Otherwise background shells clear at the next turn's end: the plugin API has no live read of them (#5).

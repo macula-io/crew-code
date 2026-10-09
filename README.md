@@ -56,7 +56,17 @@ Change them with `/config` or under `pluginConfigs.crew.options` in `~/.claude/s
 | `/crew-park [off]` | Parks this session: wake-on-idle never wakes it and the dashboard shows it parked. `off` unparks it. The owner's manual override: members park themselves with `crew_park`. |
 | `/crew-progress on \| off` | Turns progress reporting on or off for this session. |
 
-Sessions also get two tools: `report_progress` for the progress bar, and `crew_park` (`parked` 1 or 0, and a `reason`), which a member calls itself when the supervisor or the owner tells it to stop or to resume.
+Sessions also get three tools: `report_progress` for the progress bar; `crew_park` (`parked` 1 or 0, and a `reason`), which a member calls itself when the supervisor or the owner tells it to stop or to resume; and `crew_refresh` (a `reason`), which a member calls when told to refresh. It runs the same flow as `/crew-refresh now` (safety check, handover, clear, resume) whatever the member's refresh mode, and leaves that mode as it was.
+
+## What the dashboard tells you
+
+- **Needs you**, at the top: every session waiting on the owner, by the kitty tab to click and what it waits on. A question menu, a permission dialog, an MCP server asking for input, an engine notification and a turn that ends on a question all count.
+- **Waiting** names what the session waits on: background work, a scheduled wake-up, or an unfinished task. A row never says waiting without saying on what.
+- **Refresh**: a running refresh shows its phase (due, handing over, clearing), and for half an hour after one the row shows the drop, e.g. `refreshed 53% → 4%`. A handover a member writes on its own is not a refresh and shows nothing.
+
+## Assignments survive a refresh
+
+A refresh clears the member's chat, so its assignment lives outside it: the card it holds on the board, and the supervisor's brief file `~/.claude/sessions/BRIEF_<YYYY-MM-DD>_<Name>.md` (the supervisor's prompt tells it to write one with each assignment). The resume prompt points the fresh session at both, as well as at its handover.
 
 ## Limits every session keeps
 

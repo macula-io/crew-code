@@ -22,7 +22,8 @@ export type CrewRefreshPhase = 'none' | 'due' | 'handover' | 'clearing'
 
 export type CrewRefreshFlow = { phase: CrewRefreshPhase; requestedAt: number; name: string; path: string; isForced: boolean; isLimit: boolean }
 
-export type CrewRefresh = { threshold: number; isAuto: boolean; isPackage?: boolean; refreshedAt: number | null; phase: CrewRefreshPhase }
+// `fromPercent`: the context a recent refresh started from, so the row can show the drop (absent in older beats).
+export type CrewRefresh = { threshold: number; isAuto: boolean; isPackage?: boolean; refreshedAt: number | null; phase: CrewRefreshPhase; fromPercent?: number }
 
 // The card this session claimed and its context then, until it is finished.
 export type CrewCardStart = { cardId: string; issueRef: string; percent: number }

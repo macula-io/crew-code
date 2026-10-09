@@ -96,7 +96,7 @@ const goalOf = (result: Record<string, unknown>): CrewGoal | null => {
 const loadGoal = async ($: EngineInterface) => {
   if (BOARD === 'off') return NO_GOAL
   const asked = await askBoard($, 'mcl-kanban/get_goal', {})
-  return update($, goalView, seen => ('error' in asked ? { goal: seen.goal, error: asked.error } : { goal: goalOf(asked.result), error: '' }))
+  return update($, goalView, seen => (asked.error !== undefined ? { goal: seen.goal, error: asked.error } : { goal: goalOf(asked.result ?? {}), error: '' }))
 }
 
 const dayOf = (at: number) => new Date(at).toISOString().slice(0, 10)
@@ -124,6 +124,11 @@ const isPackageOf = async ($: EngineInterface, name: string) => (await modeOf($,
 // A member told to stop is parked (`park:<name>`, by name as above): wake-on-idle never wakes it.
 // The member parks itself with the crew_park tool; /crew-park is the owner's manual override.
 const PARK_TOOL = 'mcp__crew__crew_park'
+// A member told to refresh calls crew_refresh: the forced flow of /crew-refresh now, whatever its mode,
+// which stays as it was. A handover a member writes on its own is invisible here and clears nothing.
+const REFRESH_TOOL = 'mcp__crew__crew_refresh'
+// How long after a refresh its row shows the context it dropped from.
+const REFRESHED_SHOWN_MS = 30 * 60_000
 const isParkedOf = async ($: EngineInterface, name: string) => (await $.store.get(`park:${name}`)) === 1
 const setParked = async ($: EngineInterface, name: string, isParked: boolean) => {
   await (isParked ? $.store.set(`park:${name}`, 1) : $.store.delete(`park:${name}`))
@@ -164,9 +169,36 @@ const limitPrompt = (path: string, percent: number) => [
   `Then answer exactly ${HANDOVER_WRITTEN}. Only if you cannot reach a safe point at all, answer exactly ${REFRESH_DECLINED} and one line saying why.`,
 ].join(' ')
 
-const resumePrompt = (name: string, path: string) =>
-  `You are ${name}. The crew mod just refreshed this session. Read your handover ${path}. ` +
-  'If it names an open question or a reply you are waiting on, read your messages first. Then work the board.'
+// The resume names the member's assignment as it stands outside the chat, so a brief sent just before
+// the refresh is never lost: the card it holds on the board and its newest brief file.
+const resumePrompt = (name: string, path: string, card: string, brief: string) => [
+  `You are ${name}. The crew mod just refreshed this session. Read your handover ${path}.`,
+  ...(brief ? [`Read your brief ${brief}: it is your current assignment unless the handover says it is done.`] : []),
+  ...(card ? [`You hold the board card ${card}; mcl-kanban/get_my_cards shows it.`] : []),
+  'Read any messages that came in for you, then carry on with your assignment;',
+  BOARD === 'off' ? `with none, tell the ${SUPERVISOR} you are free.` : 'with none, work the board.',
+].join(' ')
+
+const escaped = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+// The member's newest brief, BRIEF_<date>_<name>.md next to its handovers, written by the Supervisor.
+const briefOf = async ($: EngineInterface, name: string) => {
+  const dir = `${(await $.env.get('HOME')) ?? ''}/.claude/sessions`
+  const entries = await $.fs.list(dir).catch(() => [])
+  const pattern = new RegExp(`^BRIEF_\\d{4}-\\d{2}-\\d{2}_${escaped(name)}\\.md$`)
+  const newest = entries.map(entry => entry.name).filter(entry => pattern.test(entry)).sort().at(-1)
+
+  return newest ? `${dir}/${newest}` : ''
+}
+
+const refreshRulePrompt = () =>
+  `Crew refresh: when the ${SUPERVISOR} or ${OWNER} tells you to refresh, call crew_refresh with the reason and end your turn; ` +
+  'the crew mod then asks you for your handover, clears this session and resumes it. Never write a handover on your own instead: ' +
+  'the mod does not see it and nothing is cleared.'
+
+const briefRulePrompt = () =>
+  'Crew briefs: when you assign work to a member, also write the brief to ~/.claude/sessions/BRIEF_<YYYY-MM-DD>_<Name>.md ' +
+  "(the member's name, today's date). A refresh clears a member's chat; its resume prompt points at its newest brief, so the assignment survives."
 
 const wakePrompt = () =>
   'The crew mod woke this session: it is idle with no card in hand. ' +
@@ -333,16 +365,20 @@ const advanceRefresh = async ($: EngineInterface, answer: string) => {
   if (!written) return abandonRefresh($, `${flow.path} does not exist`)
   if (written.mtimeMs < flow.requestedAt) return abandonRefresh($, `handover not written to ${flow.path}`)
   await update($, refreshFlow, all => ({ ...all, phase: 'clearing' as const }))
+  const fromPercent = await contextPercent($)
+  const card = await $.store.get(`card:${flow.name}`)
+  const brief = await briefOf($, flow.name)
   // Out of the turn's hook: /clear cannot run inside a hook the turn waits on.
   $.clock.after(500, async () => {
     await $.command.run({ command: 'clear' })
     await $.store.set(`name:${await $.session.id()}`, flow.name)
-    await $.store.set(`refreshed:${flow.name}`, Date.now())
+    await $.store.set(`refreshed:${flow.name}`, await $.clock.now())
+    await $.store.set(`refreshedFrom:${flow.name}`, fromPercent)
     await update($, tasks, () => ({}))
     await update($, reported, () => null)
     await update($, refreshFlow, () => IDLE_FLOW)
     await writeBeat($, { state: 'idle', lastLine: 'refreshed from handover', lastTool: '' })
-    await $.prompt.submit({ text: resumePrompt(flow.name, flow.path) })
+    await $.prompt.submit({ text: resumePrompt(flow.name, flow.path, typeof card === 'string' ? card : '', brief) })
   })
 }
 
@@ -480,10 +516,13 @@ const refreshOf = async ($: EngineInterface, name: string) => {
   const threshold = await thresholdOf($, name)
   const { phase } = await read($, refreshFlow)
   const isPackage = await isPackageOf($, name)
-  if (threshold === 0 && !isPackage && phase === 'none') return null
   const refreshedAt = Number(await $.store.get(`refreshed:${name}`)) || null
+  const isRecent = refreshedAt !== null && (await $.clock.now()) - refreshedAt < REFRESHED_SHOWN_MS
+  if (threshold === 0 && !isPackage && phase === 'none' && !isRecent) return null
+  const from = Number(await $.store.get(`refreshedFrom:${name}`))
+  const recent = isRecent && Number.isFinite(from) && from > 0 ? { fromPercent: from } : {}
 
-  return { threshold, isAuto: await isAutoOf($, name), isPackage, refreshedAt, phase }
+  return { threshold, isAuto: await isAutoOf($, name), isPackage, refreshedAt, phase, ...recent }
 }
 
 // Sessions that ended in this process (a resume or a fork moved on). Timers started for
@@ -580,6 +619,9 @@ const stateOf = (state: string): CrewState =>
 // A permission dialog that is open, with the row as it stood before it, so the call it
 // stood on clears it once answered and a background subagent's puts the main loop's state back.
 let openDialog: { before: Pick<CrewBeat, 'state' | 'lastLine' | 'lastTool'> | null } | null = null
+// An MCP elicitation that is open, with the row as it stood before it.
+let openElicitation: Pick<CrewBeat, 'state' | 'lastLine' | 'lastTool'> | null = null
+const NOT_FOR_THE_OWNER = ['idle_prompt', 'auth_success', 'permission_prompt', 'elicitation_dialog']
 
 export const register: Register = (on, options) => {
   const settings = options as { supervisor?: string; members?: string; owner?: string; board?: string; realm?: string }
@@ -623,6 +665,17 @@ export const register: Register = (on, options) => {
           reason: { type: 'string', description: 'Who told you to stop or resume, and why, in one line' },
         },
         required: ['parked', 'reason'],
+      },
+    })
+    await $.tool.register({
+      name: 'crew_refresh',
+      description:
+        `Refresh this session from a handover, now, whatever its refresh mode. Call it when the ${SUPERVISOR} or ${OWNER} tells you to refresh, ` +
+        'then end your turn: the crew mod asks you for your handover, clears this session and resumes it. The refresh mode is left as it was.',
+      inputSchema: {
+        type: 'object',
+        properties: { reason: { type: 'string', description: 'Who told you to refresh, and why, in one line' } },
+        required: ['reason'],
       },
     })
     await writeBeat($, { state: 'idle' })
@@ -711,6 +764,38 @@ export const register: Register = (on, options) => {
     await writeBeat($, { state: 'needs-you', lastTool: tool, lastLine: `permission for ${tool}` })
 
     return decided
+  })
+
+  // An MCP server asking the owner for input: a dialog in the tab until it is answered, unless a hook
+  // beneath declined it (then no dialog shows).
+  on('classic.Elicitation', async ($, e, next) => {
+    const decided = await next(e)
+    if (decided.block !== undefined) return decided
+    const held = await read($, me)
+    openElicitation = held && held.state !== 'needs-you' ? { state: held.state, lastLine: held.lastLine, lastTool: held.lastTool } : null
+    await writeBeat($, { state: 'needs-you', lastTool: e.mcp_server_name, lastLine: `${e.mcp_server_name} asks: ${e.message}`.slice(0, 160) })
+
+    return decided
+  })
+
+  on('classic.ElicitationResult', async ($, e, next) => {
+    const done = await next(e)
+    const before = openElicitation
+    openElicitation = null
+    await writeBeat($, before ?? { state: 'working' })
+
+    return done
+  })
+
+  // The engine telling the owner something waits on them, in this tab. The idle prompt is the end of a
+  // turn (the row already says idle or waiting); permission and elicitation dialogs have their own hooks.
+  on('classic.Notification', async ($, e, next) => {
+    const done = await next(e)
+    if (!NOT_FOR_THE_OWNER.includes(e.notification_type)) {
+      await writeBeat($, { state: 'needs-you', lastLine: (e.message || e.title || e.notification_type).slice(0, 160) })
+    }
+
+    return done
   })
 
   // The main loop's Stop knows what is still in flight; it may land before or after turn.complete.
@@ -813,8 +898,10 @@ export const register: Register = (on, options) => {
     const board = boardText === null ? [] : [{ id: 'crew:board', text: boardText, scope: 'session' as const }]
     const isOff = (await $.store.get(`progress-off:${await $.session.id()}`)) === 1
     const progress = isOff ? [] : [{ id: 'crew:progress', text: progressPrompt(), scope: 'session' as const }]
+    const refresh = [{ id: 'crew:refresh', text: refreshRulePrompt(), scope: 'session' as const }]
+    const briefs = (await currentName($)) === SUPERVISOR ? [{ id: 'crew:briefs', text: briefRulePrompt(), scope: 'session' as const }] : []
 
-    return { ...composed, sections: [...composed.sections, ...board, ...progress] }
+    return { ...composed, sections: [...composed.sections, ...board, ...progress, ...refresh, ...briefs] }
   })
 
   // The board is the card boundary: a claim at or above the claim limit is refused and turns
@@ -841,9 +928,12 @@ export const register: Register = (on, options) => {
       await update($, wakes, () => 0)
       await update($, boardEmptyAt, () => 0)
       await update($, cardStart, () => ({ cardId: claimed.cardId, issueRef: claimed.issueRef, percent }))
+      // By name, so the fresh session after a refresh is pointed at the card it holds.
+      if (claimed.issueRef) await $.store.set(`card:${await currentName($)}`, claimed.issueRef)
       await writeBeat($, {})
       if (await crossesPackage($, claimed.workPackage, percent)) return withNote(ran, PACKAGE_HANDOVER_NOTE)
     }
+    if (procedure === 'mcl-kanban/finish_card' || procedure === 'mcl-kanban/release_card') await $.store.delete(`card:${await currentName($)}`)
     if (procedure === 'mcl-kanban/finish_card') await logCardUsage($, String(call.args?.card_id ?? ''), percent)
 
     return ran
@@ -874,6 +964,20 @@ export const register: Register = (on, options) => {
     await setParked($, name, isParked)
 
     return { result: isParked ? `${name} is parked (${reason}): wake-on-idle no longer wakes it. End your turn.` : `${name} is unparked (${reason}): wake-on-idle wakes it again to work the board.` }
+  })
+
+  on('tool.call', { tool: REFRESH_TOOL }, async ($, e) => {
+    const reason = String((e as unknown as { reason?: unknown }).reason ?? '').slice(0, 160)
+    const flow = await read($, refreshFlow)
+    if (flow.phase !== 'none') return { result: `A refresh is already under way (${REFRESH_LABEL[flow.phase]}); nothing more to do. End your turn.` }
+    await update($, refreshFlow, all => ({ ...all, phase: 'due' as const, isForced: true, isLimit: false }))
+    await writeBeat($, {})
+
+    return {
+      result:
+        `Refresh requested (${reason}). End your turn now: the crew mod then asks you for your handover, clears this session ` +
+        'and resumes it from the handover. Your refresh mode is unchanged.',
+    }
   })
 
   on('tool.call', { tool: 'TaskCreate' }, async ($, e, next) => {
@@ -948,9 +1052,18 @@ export const register: Register = (on, options) => {
     const fiveHour = Math.max(...list.map(beat => beat.fiveHourPercent ?? 0))
     const lineWidth = Math.max(10, width - 2)
     const { goal, error } = await read($, goalView)
+    const needy = list.filter(beat => beat.state === 'needs-you')
 
     return (
       <Box flexDirection="column">
+        {needy.length > 0 && (
+          <Box flexDirection="column">
+            <Text color="yellow" bold>needs you ({needy.length})</Text>
+            {needy.map(beat => (
+              <Text color="yellow" wrap="truncate-end">{`  ! ${beat.name} tab: ${beat.lastLine || `${beat.lastTool || 'something'} waits on you`}`}</Text>
+            ))}
+          </Box>
+        )}
         <Box flexDirection="row" justifyContent="space-between">
           <Text bold>
             {online.length}/{list.length} online · ${total.toFixed(2)} spent · 5h window {fiveHour.toFixed(0)}%
@@ -975,7 +1088,7 @@ export const register: Register = (on, options) => {
           const isOff = beat.state === 'offline'
           const activity =
             beat.state === 'working' && beat.lastTool ? `running ${beat.lastTool}`
-            : beat.state === 'waiting' && beat.waitingOn ? `waiting on ${beat.waitingOn}`
+            : beat.state === 'waiting' ? `waiting on ${beat.waitingOn || 'nothing it named'}`
             : beat.lastLine
           const doing = beat.card ? `${beat.card} · ${activity}` : activity
 
@@ -989,7 +1102,9 @@ export const register: Register = (on, options) => {
                 {pad(beat.costUsd === null ? '-' : `$${beat.costUsd.toFixed(2)}`, 8)}
                 {pad(String(beat.turns), 6)}
                 {pad(ago(now, beat.beatAt), 5)}
-                {beat.refresh && <Text color="magenta">↻{beat.refresh.isAuto ? 'auto' : beat.refresh.isPackage ? 'pkg' : `${beat.refresh.threshold}%`} </Text>}
+                {beat.refresh && (beat.refresh.isAuto || beat.refresh.isPackage || beat.refresh.threshold > 0) && (
+                  <Text color="magenta">↻{beat.refresh.isAuto ? 'auto' : beat.refresh.isPackage ? 'pkg' : `${beat.refresh.threshold}%`} </Text>
+                )}
                 {beat.isParked && <Text color="yellow">parked </Text>}
                 {beat.repo}
               </Text>
@@ -1010,6 +1125,9 @@ export const register: Register = (on, options) => {
               })()}
               {beat.refresh && beat.refresh.phase !== 'none' && !isOff && (
                 <Text color="magenta">{'  '}↻ {REFRESH_LABEL[beat.refresh.phase]}</Text>
+              )}
+              {beat.refresh?.fromPercent !== undefined && beat.refresh.phase === 'none' && beat.refresh.refreshedAt !== null && now - beat.refresh.refreshedAt < REFRESHED_SHOWN_MS && !isOff && (
+                <Text color="magenta">{`  ↻ refreshed ${beat.refresh.fromPercent}% → ${beat.contextPercent ?? '-'}% ${ago(now, beat.refresh.refreshedAt)} ago`}</Text>
               )}
               {doing !== '' && !isOff && <Text dimColor wrap="truncate-end">{'  '}{pad(doing, lineWidth)}</Text>}
             </Box>
