@@ -427,7 +427,7 @@ test('a title that is nobody on the roster yields to CREW_NAME', CREW, async ($,
 
 // A crew session with a context level the test controls, every prompt it is sent and every file it writes.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const crewSession = (on: any, store: Map<string, unknown>, context: { percent: number }) => {
+const crewSession = (on: any, store: Map<string, unknown>, context: { percent: number; rateLimits?: unknown[] }) => {
   const prompts: string[] = []
   const files = new Map<string, string>()
   mock.env(on, { HOME: '/home/test' })
@@ -440,7 +440,7 @@ const crewSession = (on: any, store: Map<string, unknown>, context: { percent: n
   }))
   on('fs.stat', () => ({ value: { kind: 'file', size: 10, mtimeMs: Date.now() + 60_000, isLink: false } }))
   on('session.id', () => ({ value: 'id-crew' }))
-  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000, percent: context.percent }, rateLimits: [] } }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000, percent: context.percent }, rateLimits: context.rateLimits ?? [] } }))
   on('session.repo', () => ({ value: null }))
   on('session.cwd', () => ({ value: '/w' }))
   on('session.root', () => ({ value: '/w' }))
@@ -1195,4 +1195,55 @@ test('every session is told: one menu per change, routine asks to queue_ask; the
   expect(text).toContain('one menu per change')
   expect(text).toContain('queue_ask')
   expect(text).toContain('take_asks')
+})
+
+// crew-code#14: budget gauges. The weekly window comes from the engine's rate-limit reading (seven_day);
+// the Fable gauge has no reading and is set by the owner with /crew-budget.
+const DAY = 24 * 3600_000
+const weekly = (percent: number, resetsInMs: number) => ({ kind: 'seven_day', percentUsed: percent, resetsAt: new Date(NOW + resetsInMs).toISOString() })
+
+test('a beat carries the weekly window: percent used and when it resets', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  const files = crewSession(on, new Map([['name:id-crew', 'Mars']]), { percent: 10, rateLimits: [weekly(91, 3 * DAY)] }).files
+  const latest = () => JSON.parse(files.get('/home/test/.claude/crew/id-crew.json') ?? '{}')
+
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  expect(latest().weekly).toMatchObject({ percent: 91, resetsAt: NOW + 3 * DAY })
+})
+
+test('the dashboard shows the weekly gauge, its reset, and a run-out that comes before the reset', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  // 91% used with 3 of 7 days left: at this pace it runs out in well under a day, before the reset.
+  dashboardOf(on, [{ name: 'Mars', weekly: { percent: 91, resetsAt: NOW + 3 * DAY } }])
+
+  await $.command.run({ command: 'crew', args: '' } as never)
+  const ui = await paneOf($)
+  expect(await ui.find({ text: /weekly 91%/ })).toBeDefined()
+  expect(await ui.find({ text: /resets in 3d/ })).toBeDefined()
+  expect(await ui.find({ text: /runs out in \d+h, before the reset/ })).toBeDefined()
+})
+
+test('/crew-budget sets the Fable gauge, and the dashboard shows it with when it was set', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Supervisor']])
+  mock.clock(on, { now: NOW })
+  crewSession(on, store, { percent: 20 })
+
+  const set = await $.command.run({ command: 'crew-budget', args: 'fable 56' } as never)
+  expect(set.text).toContain('Fable 56%')
+  expect(store.get('budget:fable')).toMatchObject({ percent: 56, at: NOW })
+  const shown = await $.command.run({ command: 'crew-budget', args: '' } as never)
+  expect(shown.text).toContain('Fable 56%')
+})
+
+test('the Supervisor reads the budget in its prompt, and holds big packages when it runs out before the reset', async ($, on) => {
+  const store = new Map<string, unknown>([['name:id-crew', 'Supervisor'], ['budget:fable', { percent: 56, at: NOW }]])
+  mock.clock(on, { now: NOW })
+  crewSession(on, store, { percent: 20, rateLimits: [weekly(91, 3 * DAY)] })
+  on('prompt.compose', () => ({ sections: [] }) as never)
+
+  const composed = await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: [], tools: [], outputStyle: null, traits: [] } as never)
+  const budget = composed.sections.find((section: { id: string }) => section.id === 'crew:budget')?.text ?? ''
+  expect(budget).toContain('weekly 91%')
+  expect(budget).toContain('Fable 56%')
+  expect(budget).toContain('before the reset')
 })
