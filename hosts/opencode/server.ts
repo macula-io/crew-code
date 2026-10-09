@@ -11,12 +11,18 @@
 // names, resumes the room cursor this member persisted, and its teardown never marks the member
 // offline: only the process going away for good does that, through one module-level exit dispatcher.
 //
+// OpenCode connects MCP servers per location (#23): a member that touches a second directory (a
+// session tab it restores, a project it resolves) would run a second macula-mcp under the same
+// identity and the copies flap each other off the station. The config ships the macula entry
+// disabled; setup enables it in the member's own directory (CREW_WORKDIR, where the launcher started
+// the process) and leaves it out of every other location, so one member runs one macula-mcp.
+//
 // Loaded by bin/crew through OPENCODE_CONFIG_CONTENT ({"plugins": ["file://.../hosts/opencode"]}): OpenCode 2
 // loads a plugin directory's `server` entry, this file.
 import { execFileSync } from 'node:child_process'
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname } from 'node:path'
+import { dirname, resolve } from 'node:path'
 
 import { acceptEnvelope, fenceDelivery, roomRulesPrompt, type Roster } from '../../core/crew_room.ts'
 import { rowToMessage, type TranscriptRow } from './room.ts'
@@ -45,6 +51,13 @@ type Ctx = {
   }
   model?: { list?: () => Promise<unknown> }
   tool: { transform: (edit: (tools: { add: (tool: Record<string, unknown>) => void }) => void) => Promise<unknown> }
+  mcp?: { transform: (edit: (editor: McpEditor) => void) => Promise<unknown> }
+}
+
+// The MCP editor's parts this plugin uses: the location's server table, writable from a transform.
+type McpEditor = {
+  update: (name: string, edit: (config: { disabled?: boolean }) => void) => void
+  remove: (name: string) => void
 }
 
 const ROOM_POLL_MS = 10_000
@@ -124,6 +137,29 @@ const repoOf = (directory: string) => {
   }
 }
 
+// One macula-mcp per member (#23): OpenCode connects MCP servers per location, and it boots a location for
+// every directory the process touches. The config ships the macula entry disabled; here the member's own
+// directory (where bin/crew started this process, CREW_WORKDIR) enables it, and every other location drops
+// it, so the member runs one mesh peer however many locations the process holds.
+const sameDirectory = (a: string, b: string) => {
+  const real = (path: string) => {
+    try {
+      return realpathSync.native(path)
+    } catch {
+      return resolve(path)
+    }
+  }
+  return real(a) === real(b)
+}
+const scopeMacula = async (ctx: Ctx, directory: string, isHome: boolean) => {
+  if (!ctx.mcp?.transform) return
+  await ctx.mcp.transform((editor) => {
+    if (isHome) editor.update('macula', (config) => { config.disabled = false })
+    else editor.remove('macula')
+  })
+  trace(`macula ${isHome ? `enabled in ${directory}` : `left out of ${directory}`}`)
+}
+
 // The model's context window, by provider/model id, from ctx.model.list(); empty when it cannot be read.
 const limitsOf = async (ctx: Ctx) => {
   const limits = new Map<string, number>()
@@ -199,6 +235,8 @@ export const start = async (ctx: Ctx, options: StartOptions = {}) => {
   trace(`setup name=${name || '(none)'}`)
   if (name === '') return
   const directory = ctx.location?.directory ?? process.cwd()
+  const ownLocation = sameDirectory(directory, process.env.CREW_WORKDIR?.trim() || process.cwd())
+  await scopeMacula(ctx, directory, ownLocation).catch(error => trace(`macula scope failed: ${String(error)}`))
   const repo = repoOf(directory)
   let limits = await limitsOf(ctx)
   let tracker: Tracker = fresh()
@@ -312,6 +350,10 @@ export const start = async (ctx: Ctx, options: StartOptions = {}) => {
     }
   }
   const readRoom = async () => {
+    // One delivering instance per member (#19): every location OpenCode boots runs another plugin
+    // instance with its own in-memory cursor, and each would deliver rows the others did too. The room
+    // is delivered from the member's own location only, the one that also runs its macula server (#23).
+    if (!ownLocation) return
     if (!topic || !myId) return
     if (roomCursor < 0) {
       // A fresh member does not replay the room's history; a reload resumes from its saved cursor.
@@ -334,8 +376,25 @@ export const start = async (ctx: Ctx, options: StartOptions = {}) => {
         if (accepted.reason === 'unattested' || accepted.reason === 'not_on_roster') roomRefused += 1
         continue
       }
+      // One turn per row, whatever overlaps (#19): the claim file is the atomic gate two instances
+      // cannot both pass, and it survives a reload, so a lagging instance cannot deliver the row again.
+      // Keyed by member as well: members share the crew directory, and an id another member already
+      // claimed must not silence this member's copy.
+      const claim = `${crewDir}/opencode/delivered/${name}/${message.message_id}`
+      mkdirSync(dirname(claim), { recursive: true })
+      try {
+        writeFileSync(claim, '', { flag: 'wx' })
+      } catch (error) {
+        if ((error as { code?: string }).code === 'EEXIST') continue
+        throw error
+      }
       trace(`room delivers ${message.message_id} from ${accepted.sender}`)
-      await ctx.session.prompt({ sessionID: current, text: fenceDelivery(message, accepted, { boundary: boundary(), owner, supervisor }), delivery: 'queue' })
+      try {
+        await ctx.session.prompt({ sessionID: current, text: fenceDelivery(message, accepted, { boundary: boundary(), owner, supervisor }), delivery: 'queue' })
+      } catch (error) {
+        rmSync(claim, { force: true })
+        throw error
+      }
     }
     if (rows.length > 0) saveCursor()
     if (roomRefused > 0) trace(`room refused ${roomRefused}`)

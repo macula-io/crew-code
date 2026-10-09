@@ -1,6 +1,10 @@
 // Tests for the OpenCode plugin's server part (not *.test.ts: those are the Claude plugin's tests, which
-// `claude plugin test` loads). Two faults found live on 2026-10-09:
+// `claude plugin test` loads). Faults found live on 2026-10-09:
 //
+//   #19  a room row reached an OpenCode member up to three times: every OpenCode location boots another
+//        plugin instance, each with its own in-memory cursor, and each delivered rows the others did
+//        too. The room is delivered from the member's own location only, and a per-message claim file
+//        keeps delivery idempotent where instances overlap.
 //   #22  OpenCode evicts a location and boots the plugin again in the same process (OpenCode's log:
 //        "location services evicted" / "booted" / "loading plugin", every 20-60 minutes on an idle
 //        member). The reloaded plugin started with empty state: it never adopted the member's existing
@@ -9,6 +13,9 @@
 //        the process lives.
 //   #21  crew_park, crew_log, report_progress and queue_ask returned "Tool result declared output
 //        without an output schema": a tool with no output schema must return `content`, never `output`.
+//   #23  OpenCode connects MCP servers per location: every directory a member's process resolves ran
+//        another macula-mcp under its identity, and the copies flapped each other off the station. The
+//        launcher ships the entry disabled; setup enables it in the member's own directory only.
 //
 // Run: node --experimental-strip-types --test hosts/opencode/server.node-test.ts
 import { test } from 'node:test'
@@ -64,7 +71,9 @@ const memorySource = () => {
 const fakeCtx = (prompts: { sessionID: string; text: string }[]) => {
   const tools: Record<string, { execute: (input: unknown, context: { sessionID: string }) => Promise<Record<string, unknown>> }> = {}
   return {
-    location: { directory: tmpdir() },
+    // The member's own location, resolved as the plugin resolves it (CREW_WORKDIR, else the process
+    // cwd): room delivery is scoped to it (#19).
+    location: { directory: process.env.CREW_WORKDIR?.trim() || process.cwd() },
     event: { subscribe: () => (async function* () {})() },
     session: {
       get: async ({ sessionID }: { sessionID: string }) => {
@@ -178,4 +187,109 @@ test('the crew tools return the field OpenCode accepts for a tool with no output
   assert.equal(line.event, 'checkpoint')
   assert.equal(line.package, 'macula-io/crew-code#21')
   assert.equal(line.name, 'Probe')
+})
+
+// crew-code#23: OpenCode connects MCP servers per location, so the macula entry ships disabled and setup
+// enables it in the member's own directory (CREW_WORKDIR, else the process cwd) only: a second location
+// drops it instead of spawning a second macula-mcp under the same identity.
+test('macula is enabled in the member\'s own directory and left out of every other location (#23)', async (t) => {
+  const dir = crewDirWith()
+  const applied: string[] = []
+  const withMcp = (directory: string) => {
+    const ctx = fakeCtx([])
+    return {
+      ...ctx,
+      location: { directory },
+      mcp: {
+        transform: async (edit: (editor: {
+          update: (name: string, update: (config: { disabled?: boolean }) => void) => void
+          remove: (name: string) => void
+        }) => void) => {
+          let enabled = false
+          let removed = false
+          edit({
+            update: (_name, update) => {
+              const config: { disabled?: boolean } = { disabled: true }
+              update(config)
+              enabled = config.disabled === false
+            },
+            remove: () => { removed = true },
+          })
+          applied.push(enabled ? 'enabled' : removed ? 'removed' : 'untouched')
+        },
+      },
+    }
+  }
+  const previous = process.env.CREW_WORKDIR
+  process.env.CREW_WORKDIR = '/home/probe'
+  t.after(() => {
+    if (previous === undefined) delete process.env.CREW_WORKDIR
+    else process.env.CREW_WORKDIR = previous
+  })
+
+  const homeTeardown = await start(withMcp('/home/probe'), options(dir, memorySource()))
+  t.after(async () => { await homeTeardown?.() })
+  await until(() => applied.length === 1)
+  assert.deepEqual(applied, ['enabled'])
+
+  const otherTeardown = await start(withMcp('/home/probe/other-location'), options(dir, memorySource()))
+  t.after(async () => { await otherTeardown?.() })
+  await until(() => applied.length === 2)
+  assert.deepEqual(applied, ['enabled', 'removed'])
+})
+
+// crew-code#19: every location boots another plugin instance; on 2026-10-09 one row reached an OpenCode
+// member three times. Each instance keeps its own in-memory cursor, so an instance lagging behind
+// delivers rows the instance that owns the member's location already delivered. The room is delivered
+// from the member's own location only (the one that also runs its macula server, #23).
+test('a second instance in another location does not deliver the room row again (#19)', async (t) => {
+  const dir = crewDirWith()
+  const source = memorySource()
+  const previous = process.env.CREW_WORKDIR
+  process.env.CREW_WORKDIR = '/home/probe'
+  t.after(() => {
+    if (previous === undefined) delete process.env.CREW_WORKDIR
+    else process.env.CREW_WORKDIR = previous
+  })
+  const home = fakeCtx([])
+  const other = fakeCtx([])
+  const homePrompts: { text: string }[] = []
+  const otherPrompts: { text: string }[] = []
+  home.session.prompt = async (input: { text: string }) => { homePrompts.push(input); return {} }
+  other.session.prompt = async (input: { text: string }) => { otherPrompts.push(input); return {} }
+  home.location = { directory: '/home/probe' }
+  other.location = { directory: '/home/probe/other' }
+  const stopHome = await start(home, options(dir, source))
+  const stopOther = await start(other, options(dir, source))
+  t.after(async () => { await stopHome?.(); await stopOther?.() })
+  // Both instances are live before the row exists (the home one fixes its cursor; on the bug both do).
+  await new Promise(resolve => setTimeout(resolve, 300))
+  source.add(row(2, { text: 'the go' }))
+  await until(() => homePrompts.length > 0)
+  // Long enough for the other instance to deliver it too, had nothing stopped it.
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.equal(homePrompts.length, 1, 'the owning location delivers the row once')
+  assert.equal(otherPrompts.length, 0, 'the other location delivers nothing')
+})
+
+// The backstop where two instances of the same location overlap (a reload booting the replacement before
+// the old instance's timers stop): the claim file is the atomic gate, so one row is still one turn.
+test('two overlapping instances of one location deliver the room row once (#19)', async (t) => {
+  const dir = crewDirWith()
+  const source = memorySource()
+  const prompts: { text: string }[] = []
+  const first = fakeCtx([])
+  const second = fakeCtx([])
+  first.session.prompt = async (input: { text: string }) => { prompts.push(input); return {} }
+  second.session.prompt = async (input: { text: string }) => { prompts.push(input); return {} }
+  const stopFirst = await start(first, options(dir, source))
+  const stopSecond = await start(second, options(dir, source))
+  t.after(async () => { await stopFirst?.(); await stopSecond?.() })
+  // Both instances are live and past their first room read before the row exists.
+  await new Promise(resolve => setTimeout(resolve, 100))
+  source.add(row(2, { text: 'once, however many readers' }))
+  await until(() => prompts.length > 0)
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.equal(prompts.length, 1, 'one row is one turn')
+  assert.equal(existsSync(join(dir, 'opencode', 'delivered', 'Probe', '0'.repeat(31) + '2')), true, 'the claim is on disk')
 })

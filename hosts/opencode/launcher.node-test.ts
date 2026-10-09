@@ -46,19 +46,27 @@ test('a Claude member\'s fresh beat stays live by the beat alone, as before', ()
 
 // The member's macula server (Supervisor, Vesta's report): OpenCode drops an inline MCP entry that has no command
 // and runs the global one, so every OpenCode member shared the global config's identity. The launcher gives a
-// complete entry, which replaces the global one: the crew's macula-mcp release, keyed by the member's name.
-const openCodeConfigOf = (dir: string) => {
+// complete entry, which replaces the global one: the crew's macula-mcp release, keyed by the member's name. It
+// ships disabled (#23): OpenCode connects MCP servers per location, so the plugin enables it in the member's own
+// directory only, and the launcher passes that directory as CREW_WORKDIR.
+const openCodeLaunch = (dir: string) => {
   const out = execFileSync('bash', [CREW, 'Probe'], { env: { ...process.env, HOME: dir, CREW_DRY_RUN: '1', CREW_AGENT: 'opencode' }, encoding: 'utf8' })
-  const line = out.split('\n').find(line => line.startsWith('[here]')) ?? ''
-  const unquoted = execFileSync('bash', ['-c', 'eval "a=($1)"; for x in "${a[@]}"; do [[ $x == OPENCODE_CONFIG_CONTENT=* ]] && printf %s "${x#*=}"; done; true', '_', line.replace(/^\[here\] cd \S+ &&/, '')], { encoding: 'utf8' })
+  return out.split('\n').find(line => line.startsWith('[here]')) ?? ''
+}
+const openCodeConfig = (launch: string) => {
+  const unquoted = execFileSync('bash', ['-c', 'eval "a=($1)"; for x in "${a[@]}"; do [[ $x == OPENCODE_CONFIG_CONTENT=* ]] && printf %s "${x#*=}"; done; true', '_', launch.replace(/^\[here\] cd \S+ &&/, '')], { encoding: 'utf8' })
   return JSON.parse(unquoted)
 }
 
-test('an OpenCode member runs its own macula server, keyed by its name, whatever the global config holds', () => {
-  const macula = openCodeConfigOf(home('opencode')).mcp.macula
+test('an OpenCode member runs its own macula server, keyed by its name, shipped disabled for the plugin to scope (#23)', () => {
+  const dir = home('opencode')
+  const launch = openCodeLaunch(dir)
+  assert.match(launch, /CREW_WORKDIR=/)
+  const macula = openCodeConfig(launch).mcp.macula
   assert.equal(macula.type, 'local')
   assert.deepEqual(macula.command.slice(-3), ['-p', '@macula-io/mcp@0.46.1', 'macula-mcp'])
   assert.deepEqual(macula.environment, { MACULA_MCP_AGENT: 'probe' })
+  assert.equal(macula.disabled, true, 'the plugin enables it in the member\'s own directory only')
 })
 
 // A mixed crew in one command (Raf, 2026-10-09): a member whose member_models entry is an OpenCode model

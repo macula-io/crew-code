@@ -28,6 +28,9 @@ PROJECTS="${HOME}/.claude/projects"
 KEYS="${HOME}/.config/macula-mcp/keys"
 # Where member sessions start. Override with CREW_WORKDIR.
 WORKDIR="${CREW_WORKDIR:-${HOME}}"
+# Absolute, for launch and for the OpenCode plugin's own-location comparison (#23): a relative CREW_WORKDIR
+# resolves once, here, against this invocation's directory.
+WORKDIR="$(cd "${WORKDIR}" 2>/dev/null && pwd || printf '%s' "${WORKDIR}")"
 # The session that coordinates the crew: it has a handover, not a role card.
 SUPERVISOR="${CREW_SUPERVISOR:-Supervisor}"
 LIVE_WINDOW_S=600
@@ -176,9 +179,12 @@ resume_prompt() {
 # every member would share that config's identity. A complete entry replaces it, environment and all, and
 # MACULA_MCP_AGENT keys the server by the member's name (agent-<name>.key, created on first start), as for a
 # Claude member.
+# It ships disabled (#23): OpenCode connects MCP servers per location (a directory), so an enabled entry runs
+# one macula-mcp per directory the member ever touches, and the copies flap each other off the station under
+# one identity. The plugin enables this single entry in the member's own directory only (CREW_WORKDIR).
 opencode_config() {
     jq -cn --arg plugin "file://${OPENCODE_PLUGIN}" --arg agent "$1" --arg pkg "${MACULA_MCP_PKG}" --arg model "$2" \
-        '{plugins: [$plugin], mcp: {macula: {type: "local", command: ["npx", "-y", "-p", $pkg, "macula-mcp"], environment: {MACULA_MCP_AGENT: $agent}}}}
+        '{plugins: [$plugin], mcp: {macula: {type: "local", command: ["npx", "-y", "-p", $pkg, "macula-mcp"], environment: {MACULA_MCP_AGENT: $agent}, disabled: true}}}
          + (if $model == "" then {} else {model: $model} end)'
 }
 
@@ -203,9 +209,10 @@ launch() {
         env -u MACULA_MCP_IDENTITY -u ANTHROPIC_API_KEY "CREW_NAME=${name}" "MACULA_MCP_AGENT=${agent}" claude --model "${model}" -n "${name}" "$@")
     if [[ "${AGENT}" == opencode ]]; then
         # --standalone: a private server, so the plugin runs in this member's process and reads its
-        # CREW_NAME. The member's mesh server and its key go through the config (opencode_config).
+        # CREW_NAME. The member's mesh server and its key go through the config (opencode_config);
+        # CREW_WORKDIR tells the plugin which location is the member's own (#23).
         cmd=("${SHELL:-/usr/bin/zsh}" -ic 'exec "$@"' crew
-            env -u MACULA_MCP_IDENTITY -u MACULA_MCP_AGENT -u ANTHROPIC_API_KEY "CREW_NAME=${name}" "CREW_SUPERVISOR=${SUPERVISOR}"
+            env -u MACULA_MCP_IDENTITY -u MACULA_MCP_AGENT -u ANTHROPIC_API_KEY "CREW_NAME=${name}" "CREW_SUPERVISOR=${SUPERVISOR}" "CREW_WORKDIR=${WORKDIR}"
             "OPENCODE_CONFIG_CONTENT=$(opencode_config "${agent}" "$(opencode_model_for "${name}")")" opencode --standalone "$@")
     fi
     if [[ -n "${CREW_DRY_RUN:-}" ]]; then

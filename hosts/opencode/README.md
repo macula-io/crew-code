@@ -10,8 +10,14 @@ room and server parts in `room.ts` and `server.ts`, with tests:
 
 ```sh
 node --experimental-strip-types --test hosts/opencode/beat.node-test.ts hosts/opencode/room.node-test.ts \
-  hosts/opencode/launcher.node-test.ts hosts/opencode/server.node-test.ts
+  hosts/opencode/launcher.node-test.ts hosts/opencode/server.node-test.ts hosts/opencode/macula.node-test.ts
 ```
+
+`macula.node-test.ts` is the #23 integration test: it runs a real `opencode` through a location boot, a second
+directory and a reload, and asserts exactly one stub macula server per member and that a room message arriving after
+the reload still reaches the member. It needs the OpenCode 2 binary on `PATH` and skips with that reason otherwise; CI
+has none (v2 is not on npm, and anomalyco/opencode's public releases stop at v1.18.35), so it runs on a workstation,
+not in CI.
 
 ## Starting a member on OpenCode
 
@@ -32,7 +38,11 @@ crew up Supervisor Ceres Vesta Juno
 `CREW_NAME`), loads this directory as a plugin and gives the member its own macula server, the crew's macula-mcp
 release keyed by the member's name (`MACULA_MCP_AGENT`, so `~/.config/macula-mcp/keys/agent-<name>.key`), all through
 `OPENCODE_CONFIG_CONTENT`. That entry replaces any `macula` server in your global OpenCode config, so members never
-share its identity. A resume reopens the OpenCode
+share its identity. It ships disabled: OpenCode connects MCP servers per location (a directory), and it boots a
+location for every directory the process resolves, so an enabled entry would run one macula-mcp per location under one
+identity and the copies would flap each other off the station (#23). The plugin enables it in the member's own
+directory only (`CREW_WORKDIR`, which the launcher passes), so one member runs one macula-mcp however many locations
+its process holds; the module doc comment in `server.ts` carries the mechanism. A resume reopens the OpenCode
 session the member's last beat names (`--session`), in `CREW_WORKDIR`. The model is `CREW_OPENCODE_MODEL`
 (`provider/model`), else the member's own OpenCode model in `member_models`, else OpenCode's default; a Claude model there does not apply.
 
@@ -76,6 +86,12 @@ plugin has no `session.created` event and no session listing to lean on, so it a
 names (`session.get`, root sessions only) and reads its room cursor back from `~/.claude/crew/opencode/room-<Name>.json`,
 which it writes on each advance. A message that arrives across the gap is therefore delivered once, not skipped; a
 brand-new member has no cursor file and still starts at `MAX(id)`, replaying nothing.
+
+Every location boots its own plugin instance, and each one used to deliver the rows it saw to the member's session:
+one row could become two or three turns (#19). Delivery is now scoped to the member's own location (the one that runs
+its macula server), and before submitting, each message claims a file by `message_id` under
+`~/.claude/crew/opencode/delivered/<Name>/` — the atomic gate two overlapping instances cannot both pass, so one row
+is one turn per member. The claim is removed only if the submit fails, so a retry can still deliver.
 
 On process exit (`/exit`, or the process going away) every member session's beat is written offline at once, so a
 member that was closed can be relaunched right away. A plugin reload is not an exit: its teardown leaves the beat
