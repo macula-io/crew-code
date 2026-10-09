@@ -53,7 +53,7 @@
     "member_models": {
       "type": "string",
       "title": "Member models",
-      "description": "Per-member worker models, comma-separated name:model pairs (for example: Venus:claude-opus-5-5, Pluto:claude-sonnet-5-5). Empty: every member runs on worker_model.",
+      "description": "Per-member worker models, comma-separated name:model pairs (for example: Venus:claude-opus-5-5, Pluto:claude-sonnet-5-5). An OpenCode model (provider/model, e.g. Ceres:deepseek/deepseek-v4-pro) starts that member on OpenCode. Empty: every member runs on worker_model.",
       "default": ""
     },
     "reviewer_model": {

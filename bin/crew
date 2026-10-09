@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # crew: bring crew members up on their own mesh key.
 #
-#   crew up [--fresh]          every member on the roster that is not running, one kitty tab each
+#   crew up [--fresh] [Name...]
+#                              every member on the roster (or only the ones named) that is not
+#                              running, one kitty tab each
 #   crew <Name> [--fresh] [--tab]
 #                              one member in THIS terminal (resumes its last session unless
 #                              --fresh); --tab opens it in a new kitty tab instead
@@ -12,9 +14,10 @@
 # Each session runs claude with CREW_NAME=<Name>, MACULA_MCP_AGENT=<name> and -n <Name>.
 # Each session runs on its model: CREW_MODEL if set, else the member's own entry in the crew plugin's
 # member_models setting, else its worker_model setting, else claude-opus-5-5.
-# CREW_AGENT=opencode runs a member on OpenCode instead (hosts/opencode/README.md):
+# A member whose model is an OpenCode model (provider/model, e.g. Ceres:deepseek/deepseek-v4-pro in
+# member_models) runs on OpenCode on that model (hosts/opencode/README.md). CREW_AGENT=opencode runs any
+# member on OpenCode, on CREW_OPENCODE_MODEL if set, else OpenCode's own default model:
 #   CREW_AGENT=opencode crew <Name> [--fresh] [--tab]
-# on CREW_OPENCODE_MODEL (provider/model) if set, else OpenCode's own default model.
 # Set CREW_DRY_RUN=1 to print the launch instead of running it.
 # Set CREW_HOLD=1 to start sessions on hold: they read their card and handover, then wait.
 set -euo pipefail
@@ -31,15 +34,15 @@ LIVE_WINDOW_S=600
 # The crew plugin's settings, as /config writes them.
 SETTINGS="${HOME}/.claude/settings.json"
 DEFAULT_MODEL=claude-opus-5-5
-# The coding agent a member runs on: claude (default) or opencode.
-AGENT="${CREW_AGENT:-claude}"
+# The coding agent every member runs on, when set: claude or opencode. Unset, each member's own (agent_for).
+AGENT="${CREW_AGENT:-}"
 # The OpenCode plugin that puts an OpenCode member on the dashboard, next to this script.
 OPENCODE_PLUGIN="${CREW_OPENCODE_PLUGIN:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/hosts/opencode}"
 
 die() { echo "crew: $*" >&2; exit 1; }
 
 case "${AGENT}" in
-    claude | opencode) ;;
+    "" | claude | opencode) ;;
     *) die "CREW_AGENT is '${AGENT}': it is claude or opencode" ;;
 esac
 
@@ -59,6 +62,25 @@ model_for() {
     [[ -n "${own}" ]] && { echo "${own}"; return 0; }
     worker="$(crew_option worker_model)"
     echo "${worker:-${DEFAULT_MODEL}}"
+}
+
+# OpenCode names its models provider/model; a Claude model id has no slash.
+is_opencode_model() { [[ "$1" == */* ]]; }
+
+# The coding agent a member runs on: CREW_AGENT, else opencode for a member on an OpenCode model, else claude.
+agent_for() {
+    [[ -n "${CREW_AGENT:-}" ]] && { echo "${CREW_AGENT}"; return 0; }
+    is_opencode_model "$(model_for "$1")" && { echo opencode; return 0; }
+    echo claude
+}
+
+# The model an OpenCode member runs on: CREW_OPENCODE_MODEL, else its own OpenCode model, else OpenCode's default.
+opencode_model_for() {
+    local model
+    [[ -n "${CREW_OPENCODE_MODEL:-}" ]] && { echo "${CREW_OPENCODE_MODEL}"; return 0; }
+    model="$(model_for "$1")"
+    is_opencode_model "${model}" && echo "${model}"
+    return 0
 }
 
 # The roster: every ROLE card, plus the supervisor.
@@ -155,7 +177,7 @@ resume_prompt() {
 # MACULA_MCP_AGENT keys the server by the member's name (agent-<name>.key, created on first start), as for a
 # Claude member.
 opencode_config() {
-    jq -cn --arg plugin "file://${OPENCODE_PLUGIN}" --arg agent "$1" --arg pkg "${MACULA_MCP_PKG}" --arg model "${CREW_OPENCODE_MODEL:-}" \
+    jq -cn --arg plugin "file://${OPENCODE_PLUGIN}" --arg agent "$1" --arg pkg "${MACULA_MCP_PKG}" --arg model "$2" \
         '{plugins: [$plugin], mcp: {macula: {type: "local", command: ["npx", "-y", "-p", $pkg, "macula-mcp"], environment: {MACULA_MCP_AGENT: $agent}}}}
          + (if $model == "" then {} else {model: $model} end)'
 }
@@ -184,7 +206,7 @@ launch() {
         # CREW_NAME. The member's mesh server and its key go through the config (opencode_config).
         cmd=("${SHELL:-/usr/bin/zsh}" -ic 'exec "$@"' crew
             env -u MACULA_MCP_IDENTITY -u MACULA_MCP_AGENT -u ANTHROPIC_API_KEY "CREW_NAME=${name}" "CREW_SUPERVISOR=${SUPERVISOR}"
-            "OPENCODE_CONFIG_CONTENT=$(opencode_config "${agent}")" opencode --standalone "$@")
+            "OPENCODE_CONFIG_CONTENT=$(opencode_config "${agent}" "$(opencode_model_for "${name}")")" opencode --standalone "$@")
     fi
     if [[ -n "${CREW_DRY_RUN:-}" ]]; then
         printf '[%s] cd %q &&' "${where}" "${cwd}"
@@ -223,6 +245,9 @@ bring_up() {
         return 0
     fi
     adopt_key "${name}"
+    # launch and bring_up_opencode see this member's agent through AGENT.
+    local AGENT
+    AGENT="$(agent_for "${name}")"
     if [[ "${AGENT}" == opencode ]]; then
         bring_up_opencode "${name}" "${mode}" "${where}"
         return 0
@@ -374,7 +399,7 @@ rename() {
     grep -rl -w "${old}" "${HOME}/.claude/projects/-home-rl-work-github-com/memory" 2>/dev/null | sed 's/^/    /' || true
 }
 
-usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # The macula-mcp release that prints a key's node id (macula-mcp-node-id), and the crew room needs (#18).
 MACULA_MCP_PKG="${CREW_MACULA_MCP:-@macula-io/mcp@0.46.1}"
@@ -429,10 +454,15 @@ main() {
             rename "$2" "$3"
             ;;
         up)
-            [[ "${2:-}" == --fresh ]] && mode=fresh
+            shift
+            [[ "${1:-}" == --fresh ]] && { mode=fresh; shift; }
             check_kitty
             write_roster
-            while read -r name; do bring_up "${name}" "${mode}" tab; done < <(roster)
+            if [[ $# -gt 0 ]]; then
+                for name in "$@"; do bring_up "${name}" "${mode}" tab; done
+            else
+                while read -r name; do bring_up "${name}" "${mode}" tab; done < <(roster)
+            fi
             ;;
         -*) die "unknown option '$1'" ;;
         *)

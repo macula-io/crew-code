@@ -18,13 +18,21 @@ CREW_AGENT=opencode crew <Name> [--fresh] [--tab]
 CREW_AGENT=opencode CREW_OPENCODE_MODEL=deepseek/deepseek-flash crew <Name> --fresh
 ```
 
+A member whose entry in the crew plugin's `member_models` setting is an OpenCode model (`provider/model`) runs on
+OpenCode on that model with no `CREW_AGENT`, so a mixed crew starts in one command:
+
+```sh
+# member_models: Ceres:deepseek/deepseek-v4-pro, Vesta:deepseek/deepseek-v4-pro, Juno:deepseek/deepseek-v4-pro
+crew up Supervisor Ceres Vesta Juno
+```
+
 `bin/crew` runs `opencode --standalone` (a private server, so the plugin runs in that member's process and reads its
 `CREW_NAME`), loads this directory as a plugin and gives the member its own macula server, the crew's macula-mcp
 release keyed by the member's name (`MACULA_MCP_AGENT`, so `~/.config/macula-mcp/keys/agent-<name>.key`), all through
 `OPENCODE_CONFIG_CONTENT`. That entry replaces any `macula` server in your global OpenCode config, so members never
 share its identity. A resume reopens the OpenCode
 session the member's last beat names (`--session`), in `CREW_WORKDIR`. The model is `CREW_OPENCODE_MODEL`
-(`provider/model`), else OpenCode's default; the crew plugin's Claude model settings do not apply.
+(`provider/model`), else the member's own OpenCode model in `member_models`, else OpenCode's default; a Claude model there does not apply.
 
 `CREW_DEBUG=<file>` makes the plugin write one line per event it sees, to check it against a new OpenCode release.
 

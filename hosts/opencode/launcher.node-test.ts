@@ -60,3 +60,33 @@ test('an OpenCode member runs its own macula server, keyed by its name, whatever
   assert.deepEqual(macula.command.slice(-3), ['-p', '@macula-io/mcp@0.46.1', 'macula-mcp'])
   assert.deepEqual(macula.environment, { MACULA_MCP_AGENT: 'ceres' })
 })
+
+// A mixed crew in one command (Raf, 2026-10-09): a member whose member_models entry is an OpenCode model
+// (provider/model) runs on OpenCode on that model, with no CREW_AGENT; `crew up <Name...>` brings up only those.
+const mixedHome = () => {
+  const dir = home('opencode')
+  writeFileSync(join(dir, '.claude', 'sessions', 'ROLE_Mars.md'), '# Mars\n')
+  const options = { member_models: 'Ceres:deepseek/deepseek-v4-pro, Mars:claude-sonnet-5-5' }
+  writeFileSync(join(dir, '.claude', 'settings.json'), JSON.stringify({ pluginConfigs: { crew: { options } } }))
+  return dir
+}
+const dryRun = (dir: string, args: string[]) =>
+  execFileSync('bash', [CREW, ...args], { env: { ...process.env, HOME: dir, CREW_DRY_RUN: '1', CREW_AGENT: '' }, encoding: 'utf8' })
+
+test('a member whose model is provider/model runs on OpenCode on that model, without CREW_AGENT', () => {
+  const launch = dryRun(mixedHome(), ['Ceres']).split('\n').find(line => line.startsWith('[here]')) ?? ''
+  assert.match(launch, /opencode --standalone/)
+  assert.match(launch, /deepseek\/deepseek-v4-pro/)
+})
+
+test('a member whose model is a Claude model still runs on claude', () => {
+  const launch = dryRun(mixedHome(), ['Mars']).split('\n').find(line => line.startsWith('[here]')) ?? ''
+  assert.match(launch, / claude --model claude-sonnet-5-5 /)
+})
+
+test('crew up with names brings up only those members, each on its own agent', () => {
+  const tabs = dryRun(mixedHome(), ['up', 'Ceres']).split('\n').filter(line => line.startsWith('[tab]'))
+  assert.equal(tabs.length, 1)
+  assert.match(tabs[0], /CREW_NAME=Ceres/)
+  assert.match(tabs[0], /opencode --standalone/)
+})
