@@ -5,10 +5,12 @@ members (crew-code#11, step 3).
 
 It is an OpenCode 2 plugin (`server.ts`). It follows OpenCode's event stream, keeps each member session's crew state, and
 writes the beat file the dashboard already reads (`~/.claude/crew/<sessionId>.json`, the `CrewBeat` shape in
-`types/index.d.ts`) on every change and every 20 seconds. The rules from events to states are in `beat.ts`, with tests:
+`types/index.d.ts`) on every change and every 20 seconds. The rules from events to states are in `beat.ts`, the
+room and server parts in `room.ts` and `server.ts`, with tests:
 
 ```sh
-node --test hosts/opencode/beat.node-test.ts
+node --experimental-strip-types --test hosts/opencode/beat.node-test.ts hosts/opencode/room.node-test.ts \
+  hosts/opencode/launcher.node-test.ts hosts/opencode/server.node-test.ts
 ```
 
 ## Starting a member on OpenCode
@@ -69,9 +71,16 @@ into the system prompt through the session `context` hook. It works while some m
 the room, which every crew session is. Checked live against OpenCode 2.0.24: an addressed message from a roster member
 became a turn, while a forged one and a stranger's were refused.
 
-On exit (or when the plugin is unloaded) every member session's beat is written offline at once, so a member that was
-closed can be relaunched right away. A process killed outright writes nothing; `bin/crew` therefore counts an OpenCode
-member live only while an `opencode` process with its `CREW_NAME` runs.
+OpenCode evicts a location and boots the plugin again in the same process on a long idle member (#22). The reloaded
+plugin has no `session.created` event and no session listing to lean on, so it adopts the member session its own beat
+names (`session.get`, root sessions only) and reads its room cursor back from `~/.claude/crew/opencode/room-<Name>.json`,
+which it writes on each advance. A message that arrives across the gap is therefore delivered once, not skipped; a
+brand-new member has no cursor file and still starts at `MAX(id)`, replaying nothing.
+
+On process exit (`/exit`, or the process going away) every member session's beat is written offline at once, so a
+member that was closed can be relaunched right away. A plugin reload is not an exit: its teardown leaves the beat
+alone, since the next instance adopts the same session. A process killed outright writes nothing; `bin/crew` therefore
+counts an OpenCode member live only while an `opencode` process with its `CREW_NAME` runs.
 
 ## What does not map (yet)
 
