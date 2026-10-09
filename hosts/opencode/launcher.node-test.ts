@@ -43,3 +43,20 @@ test('the same beat is live while an opencode process with that CREW_NAME runs',
 test('a Claude member\'s fresh beat stays live by the beat alone, as before', () => {
   assert.equal(stateOf(home('claude')), 'live')
 })
+
+// The member's macula server (Supervisor, Vesta's report): OpenCode drops an inline MCP entry that has no command
+// and runs the global one, so every OpenCode member shared the global config's identity. The launcher gives a
+// complete entry, which replaces the global one: the crew's macula-mcp release, keyed by the member's name.
+const openCodeConfigOf = (dir: string) => {
+  const out = execFileSync('bash', [CREW, 'Ceres'], { env: { ...process.env, HOME: dir, CREW_DRY_RUN: '1', CREW_AGENT: 'opencode' }, encoding: 'utf8' })
+  const line = out.split('\n').find(line => line.startsWith('[here]')) ?? ''
+  const unquoted = execFileSync('bash', ['-c', 'eval "a=($1)"; for x in "${a[@]}"; do [[ $x == OPENCODE_CONFIG_CONTENT=* ]] && printf %s "${x#*=}"; done; true', '_', line.replace(/^\[here\] cd \S+ &&/, '')], { encoding: 'utf8' })
+  return JSON.parse(unquoted)
+}
+
+test('an OpenCode member runs its own macula server, keyed by its name, whatever the global config holds', () => {
+  const macula = openCodeConfigOf(home('opencode')).mcp.macula
+  assert.equal(macula.type, 'local')
+  assert.deepEqual(macula.command.slice(-3), ['-p', '@macula-io/mcp@0.46.1', 'macula-mcp'])
+  assert.deepEqual(macula.environment, { MACULA_MCP_AGENT: 'ceres' })
+})
