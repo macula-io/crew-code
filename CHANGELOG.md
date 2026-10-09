@@ -19,6 +19,8 @@
 
 - Budget gauges: the dashboard shows the weekly window (percent used, reset) from Claude Code's own rate-limit reading, a projected run-out (red when it comes before the reset), and a Fable gauge the owner sets with `/crew-budget fable <percent>`; the supervisor's prompt carries the same line as a measurement, never as an order to slow down (#14).
 
+- Alerts: a session switching into needs-you rings the bell in its own kitty tab and shows a desktop notification ("<Name>: <what waits>"), once per switch; `/crew-sound on | off | bell | notify` mutes either or both for the whole crew (#15).
+
 ### Fixed
 - A finished task no longer shows "refresh due after this turn" when that refresh will not run (refresh off, or context under the threshold). The check is made when the task finishes, the same one the turn's end makes (#5).
 - A background subagent that ends while its session is idle leaves the dashboard's "waiting on" list at the next beat, so an idle member with nothing live shows idle without a new turn. A subagent's Stop hook also refreshes the list, since it carries the session's background work. Otherwise background shells clear at the next turn's end: the plugin API has no live read of them (#5).

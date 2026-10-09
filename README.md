@@ -55,6 +55,7 @@ Change them with `/config` or under `pluginConfigs.crew.options` in `~/.claude/s
 | `/crew-goal [refs] [sentence]` | Shows the crew's goal, or sets it: one sentence and the one or two work packages it covers. |
 | `/crew-park [off]` | Parks this session: wake-on-idle never wakes it and the dashboard shows it parked. `off` unparks it. The owner's manual override: members park themselves with `crew_park`. |
 | `/crew-progress on \| off` | Turns progress reporting on or off for this session. |
+| `/crew-sound on \| off \| bell \| notify` | When a session starts waiting on the owner, its kitty tab rings its bell (kitty marks the tab) and a desktop notification names it and what waits: once per switch, never repeated while it waits. `bell` or `notify` keeps one of the two, `off` mutes both, for the whole crew. |
 | `/crew-budget [fable <percent> \| fable off]` | Shows the budget gauges, or sets the Fable one, which Claude Code does not report. |
 
 Sessions also get three tools: `report_progress` for the progress bar; `crew_park` (`parked` 1 or 0, and a `reason`), which a member calls itself when the supervisor or the owner tells it to stop or to resume; and `crew_refresh` (a `reason`), which a member calls when told to refresh. It runs the same flow as `/crew-refresh now` (safety check, handover, clear, resume) whatever the member's refresh mode, and leaves that mode as it was.

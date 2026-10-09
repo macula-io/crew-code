@@ -168,6 +168,23 @@ const budgetLine = (weekly: CrewWeekly | null, fable: { percent: number; at: num
   return parts.join(' · ')
 }
 const BUDGET_USAGE = 'Usage: /crew-budget shows the budget. /crew-budget fable <percent> sets the Fable gauge, /crew-budget fable off clears it.'
+// A switch into needs-you alerts the owner once: the terminal bell in the session's own kitty tab (a BEL
+// written to the claude process's terminal, which kitty rings and marks on the tab) and a desktop
+// notification. `sound` (crew-wide, /crew-sound) mutes either or both.
+const BELL = 'tty=$(ps -o tty= -p "$PPID" | tr -d " "); [ -n "$tty" ] && [ "$tty" != "?" ] && printf "\\a" > "/dev/$tty"'
+const SOUND_MODES = { on: 'bell and notification', bell: 'bell only', notify: 'notification only', off: 'muted' } as const
+type SoundMode = keyof typeof SOUND_MODES
+const soundOf = async ($: EngineInterface): Promise<SoundMode> => {
+  const mode = await $.store.get('sound').catch(() => undefined)
+  return typeof mode === 'string' && mode in SOUND_MODES ? (mode as SoundMode) : 'on'
+}
+const alertOwner = async ($: EngineInterface, beat: CrewBeat) => {
+  const mode = await soundOf($)
+  if (mode === 'on' || mode === 'bell') await $.process.run(['sh', '-c', BELL]).catch(() => null)
+  if (mode === 'on' || mode === 'notify') {
+    await $.process.run(['notify-send', '-a', 'crew', beat.name, beat.lastLine || `${beat.lastTool || 'something'} waits on you`]).catch(() => null)
+  }
+}
 // How long after a refresh its row shows the context it dropped from.
 const REFRESHED_SHOWN_MS = 30 * 60_000
 const isParkedOf = async ($: EngineInterface, name: string) => (await $.store.get(`park:${name}`)) === 1
@@ -611,6 +628,7 @@ const writeBeat = async ($: EngineInterface, change: Partial<CrewBeat>) => {
   }
   await update($, me, () => beat)
   await $.fs.write(`${await crewDir($)}/${sessionId}.json`, JSON.stringify(beat))
+  if (beat.state === 'needs-you' && carried?.state !== 'needs-you') await alertOwner($, beat)
 }
 
 const loadBeats = async ($: EngineInterface) => {
@@ -689,6 +707,7 @@ export const register: Register = (on, options) => {
     await $.command.register({ name: 'crew-refresh', description: 'Refresh this session from a handover: after a task, at a package boundary, or now', argumentHint: 'auto|package [all]|on [percent]|off|now' })
     await $.command.register({ name: 'crew-goal', description: "Show the crew's goal, or set it: /crew-goal <package refs> <sentence>", argumentHint: '[org/repo#n [org/repo#m]] [sentence]' })
     await $.command.register({ name: 'crew-park', description: 'Park this session so wake-on-idle leaves it alone: /crew-park, and /crew-park off', argumentHint: 'off' })
+    await $.command.register({ name: 'crew-sound', description: 'Bell and desktop notification when a session starts waiting on you: /crew-sound off mutes', argumentHint: 'on|off|bell|notify' })
     await $.command.register({ name: 'crew-budget', description: 'Show the budget gauges, or set the Fable one: /crew-budget fable 56', argumentHint: 'fable <percent>|fable off' })
     await $.command.register({ name: 'crew-progress', description: 'Turn progress reporting on or off for this session: /crew-progress off', argumentHint: 'on|off' })
     await $.tool.register({
@@ -895,6 +914,14 @@ export const register: Register = (on, options) => {
     const line = budgetLine(weekly ?? null, await fableOf($), now)
 
     return { text: `${line ? `Budget: ${line}.` : 'No budget reading yet.'} ${BUDGET_USAGE}` }
+  })
+
+  on('command.run', { command: 'crew-sound' }, async ($, e) => {
+    const wanted = e.args.trim()
+    if (wanted in SOUND_MODES) await $.store.set('sound', wanted)
+    else if (wanted !== '') return { text: 'Usage: /crew-sound on | off | bell | notify' }
+
+    return { text: `Crew alerts when a session starts waiting on ${OWNER}: ${SOUND_MODES[await soundOf($)]}, for the whole crew. Usage: /crew-sound on | off | bell | notify` }
   })
 
   on('command.run', { command: 'crew-park' }, async ($, e) => {
