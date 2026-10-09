@@ -9,7 +9,8 @@
 #   crew ls                    roster, liveness and the session a resume would open
 #
 # Each session runs claude with CREW_NAME=<Name>, MACULA_MCP_AGENT=<name> and -n <Name>.
-# Every session runs on claude-opus-5-5 unless CREW_MODEL says otherwise.
+# Each session runs on its model: CREW_MODEL if set, else the member's own entry in the crew plugin's
+# member_models setting, else its worker_model setting, else claude-opus-5-5.
 # Set CREW_DRY_RUN=1 to print the launch instead of running it.
 # Set CREW_HOLD=1 to start sessions on hold: they read their card and handover, then wait.
 set -euo pipefail
@@ -23,10 +24,29 @@ WORKDIR="${CREW_WORKDIR:-${HOME}}"
 # The session that coordinates the crew: it has a handover, not a role card.
 SUPERVISOR="${CREW_SUPERVISOR:-Supervisor}"
 LIVE_WINDOW_S=600
-# Every crew session runs on this model, fresh or resumed. Override with CREW_MODEL.
-MODEL="${CREW_MODEL:-claude-opus-5-5}"
+# The crew plugin's settings, as /config writes them.
+SETTINGS="${HOME}/.claude/settings.json"
+DEFAULT_MODEL=claude-opus-5-5
 
 die() { echo "crew: $*" >&2; exit 1; }
+
+# One of the crew plugin's settings, or nothing.
+crew_option() {
+    [[ -f "${SETTINGS}" ]] || return 0
+    jq -r --arg k "$1" '.pluginConfigs.crew.options[$k] // empty' "${SETTINGS}" 2>/dev/null || true
+}
+
+# The model a member's session runs on, fresh or resumed (see the header).
+model_for() {
+    local name="$1" own worker
+    [[ -n "${CREW_MODEL:-}" ]] && { echo "${CREW_MODEL}"; return 0; }
+    own="$(crew_option member_models | tr ',' '\n' | awk -F: -v n="${name}" '
+        { k = $1; v = $2; gsub(/^[ \t]+|[ \t]+$/, "", k); gsub(/^[ \t]+|[ \t]+$/, "", v)
+          if (tolower(k) == tolower(n) && v != "") { print v; exit } }')"
+    [[ -n "${own}" ]] && { echo "${own}"; return 0; }
+    worker="$(crew_option worker_model)"
+    echo "${worker:-${DEFAULT_MODEL}}"
+}
 
 # The roster: every ROLE card, plus the supervisor.
 roster() {
@@ -105,15 +125,16 @@ resume_prompt() {
 launch() {
     local where="$1" name="$2" cwd="$3"
     shift 3
-    local agent
+    local agent model
     agent="$(lower "${name}")"
+    model="$(model_for "${name}")"
     # kitty @ launch runs the command in kitty's own environment, without what the
     # user's rc files export (GH_TOKEN and other secrets). A hand-opened tab runs an
     # interactive, non-login ${SHELL}; go through the same, then exec claude.
     # That shell also exports ANTHROPIC_API_KEY, which would bill every session to
     # the API key instead of the claude.ai login, so it is dropped here.
     local cmd=("${SHELL:-/usr/bin/zsh}" -ic 'exec "$@"' crew
-        env -u MACULA_MCP_IDENTITY -u ANTHROPIC_API_KEY "CREW_NAME=${name}" "MACULA_MCP_AGENT=${agent}" claude --model "${MODEL}" -n "${name}" "$@")
+        env -u MACULA_MCP_IDENTITY -u ANTHROPIC_API_KEY "CREW_NAME=${name}" "MACULA_MCP_AGENT=${agent}" claude --model "${model}" -n "${name}" "$@")
     if [[ -n "${CREW_DRY_RUN:-}" ]]; then
         printf '[%s] cd %q &&' "${where}" "${cwd}"
         printf ' %q' "${cmd[@]}"

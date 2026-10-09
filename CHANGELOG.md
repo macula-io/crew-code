@@ -25,6 +25,8 @@
 
 - A reviewing state: a row shows `reviewing` while a reviewer subagent or a review skill runs, while a reviewer still runs in the background after the turn, or when the member declares it with `report_progress`'s `phase` (#9).
 
+- Worker and reviewer models: `worker_model` and per-member `member_models` set the model the launcher starts each session on (`CREW_MODEL` still overrides); `reviewer_model` (default `fable`) is enforced on every review subagent and named in every prompt; each dashboard row shows its session's model (#10).
+
 ### Fixed
 - A finished task no longer shows "refresh due after this turn" when that refresh will not run (refresh off, or context under the threshold). The check is made when the task finishes, the same one the turn's end makes (#5).
 - A background subagent that ends while its session is idle leaves the dashboard's "waiting on" list at the next beat, so an idle member with nothing live shows idle without a new turn. A subagent's Stop hook also refreshes the list, since it carries the session's background work. Otherwise background shells clear at the next turn's end: the plugin API has no live read of them (#5).

@@ -43,6 +43,30 @@
       "title": "Board realm",
       "description": "The realm your mcl-kanban board is served in, as 64 hex characters. Empty uses the macula MCP server's default realm.",
       "default": ""
+    },
+    "worker_model": {
+      "type": "string",
+      "title": "Worker model",
+      "description": "The model the crew launcher starts every session on, unless CREW_MODEL or the member's own entry in member_models says otherwise.",
+      "default": "claude-opus-5-5"
+    },
+    "member_models": {
+      "type": "string",
+      "title": "Member models",
+      "description": "Per-member worker models, comma-separated name:model pairs (for example: Venus:claude-opus-5-5, Pluto:claude-sonnet-5-5). Empty: every member runs on worker_model.",
+      "default": ""
+    },
+    "reviewer_model": {
+      "type": "string",
+      "title": "Reviewer model",
+      "description": "The model review subagents run on: the crew mod sets it on every subagent whose type or description names a review.",
+      "options": [
+        "fable",
+        "opus",
+        "sonnet",
+        "haiku"
+      ],
+      "default": "fable"
     }
   }
 }

@@ -42,6 +42,9 @@ Answer `y` to add the marketplace, choose the user scope, then set the plugin's 
 | `owner` | The person who watches the dashboard and whose yes every push needs, as the prompts name them. | `the owner` |
 | `board` | `mesh`: members take work from an mcl-kanban board. `off`: no board. | `mesh` |
 | `realm` | The realm your board is served in (64 hex). Empty uses the macula MCP server's default realm. | empty |
+| `worker_model` | The model the launcher starts every session on. | `claude-opus-5-5` |
+| `member_models` | Per-member worker models, `Name:model` pairs, comma-separated (`Venus:claude-opus-5-5, Pluto:claude-sonnet-5-5`). | empty |
+| `reviewer_model` | The model review subagents run on (`fable`, `opus`, `sonnet`, `haiku`). The mod sets it on every subagent whose type or description names a review, whatever the session asked for. | `fable` |
 
 Change them with `/config` or under `pluginConfigs.crew.options` in `~/.claude/settings.json`.
 
@@ -97,7 +100,7 @@ crew rename <Old> <New>
 crew ls
 ```
 
-It needs kitty with `allow_remote_control yes`. Members are the `ROLE_<Name>.md` cards in `~/.claude/sessions`, plus the supervisor. Environment: `CREW_WORKDIR` (where sessions start, default `$HOME`), `CREW_SUPERVISOR`, `CREW_MODEL`, `CREW_DRY_RUN=1` to print launches, `CREW_HOLD=1` to start sessions on hold (they read their card and handover, park themselves and wait to be told to resume).
+It needs kitty with `allow_remote_control yes`. Members are the `ROLE_<Name>.md` cards in `~/.claude/sessions`, plus the supervisor. Environment: `CREW_WORKDIR` (where sessions start, default `$HOME`), `CREW_SUPERVISOR`, `CREW_MODEL` (overrides `member_models` and `worker_model` for every session), `CREW_DRY_RUN=1` to print launches, `CREW_HOLD=1` to start sessions on hold (they read their card and handover, park themselves and wait to be told to resume).
 
 ## What you need for what
 

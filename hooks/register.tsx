@@ -271,11 +271,19 @@ const ledgerRulePrompt = (isSupervisor: boolean) =>
 // A review: a subagent whose type names review or an adversary, one asked to run on the reviewer model,
 // or a review skill. A member may also declare one (report_progress phase), which holds across its tool
 // calls until it says working or the turn ends.
-const REVIEWER_MODEL = 'fable'
+// The reviewer model (the plugin's reviewer_model setting): a review subagent runs on it, whatever model the
+// session asked for. A subagent counts as a review when its type or its description names one.
+const REVIEWER_MODELS = ['fable', 'opus', 'sonnet', 'haiku']
+let REVIEWER_MODEL = 'fable'
 const isReviewText = (text: string) => /review|adversar/i.test(text)
-const isReviewCall = (e: { tool: string; subagent_type?: unknown; model?: unknown; skill?: unknown }) =>
-  (e.tool === 'Agent' && (isReviewText(String(e.subagent_type ?? '')) || String(e.model ?? '') === REVIEWER_MODEL)) ||
+const isReviewAgent = (e: { subagent_type?: unknown; description?: unknown }) =>
+  isReviewText(String(e.subagent_type ?? '')) || isReviewText(String(e.description ?? ''))
+const isReviewCall = (e: { tool: string; subagent_type?: unknown; description?: unknown; model?: unknown; skill?: unknown }) =>
+  (e.tool === 'Agent' && (isReviewAgent(e) || String(e.model ?? '') === REVIEWER_MODEL)) ||
   (e.tool === 'Skill' && isReviewText(String(e.skill ?? '')))
+const reviewerPrompt = () =>
+  `Crew reviews: reviews run on ${REVIEWER_MODEL}. When you spawn a subagent to review or attack work, the crew mod runs it on ${REVIEWER_MODEL}; ` +
+  'name it as a review in its type or description so the dashboard shows it.'
 let isReviewDeclared = false
 // How long after a refresh its row shows the context it dropped from.
 const REFRESHED_SHOWN_MS = 30 * 60_000
@@ -798,7 +806,8 @@ let openElicitation: Pick<CrewBeat, 'state' | 'lastLine' | 'lastTool'> | null = 
 const NOT_FOR_THE_OWNER = ['idle_prompt', 'auth_success', 'permission_prompt', 'elicitation_dialog']
 
 export const register: Register = (on, options) => {
-  const settings = options as { supervisor?: string; members?: string; owner?: string; board?: string; realm?: string }
+  const settings = options as { supervisor?: string; members?: string; owner?: string; board?: string; realm?: string; reviewer_model?: string }
+  REVIEWER_MODEL = REVIEWER_MODELS.includes(settings.reviewer_model?.trim() ?? '') ? (settings.reviewer_model ?? '').trim() : 'fable'
   BOARD = settings.board === 'off' ? 'off' : 'mesh'
   REALM = /^[0-9a-f]{64}$/i.test(settings.realm?.trim() ?? '') ? (settings.realm ?? '').trim().toLowerCase() : ''
   SUPERVISOR = settings.supervisor?.trim() || 'Supervisor'
@@ -954,13 +963,17 @@ export const register: Register = (on, options) => {
     const tool = String(e.tool).replace(/^mcp__/, '')
     const isSubagent = e.agentId !== undefined
     const isReview = !isSubagent && isReviewCall(e as unknown as { tool: string })
+    // A review subagent runs on the reviewer model, whatever the session asked for.
+    const call = isReview && e.tool === 'Agent' && isReviewAgent(e as unknown as { subagent_type?: unknown; description?: unknown })
+      ? ({ ...e, model: REVIEWER_MODEL } as typeof e)
+      : e
     if (isReview) await writeBeat($, { state: 'reviewing', lastTool: tool })
     else if (e.tool === 'AskUserQuestion') {
       await logEvent($, { event: 'menu', package: await packageOf($) })
       await writeBeat($, { state: 'needs-you', lastTool: tool, lastLine: 'answer the question menu' })
     }
     else if (!isSubagent) await writeBeat($, { state: isReviewDeclared ? 'reviewing' : 'working', lastTool: tool })
-    const ran = await next(e)
+    const ran = await next(call)
     const dialog = openDialog
     if (isReview && dialog === null) {
       await writeBeat($, { state: isReviewDeclared ? 'reviewing' : 'working' })
@@ -1154,7 +1167,10 @@ export const register: Register = (on, options) => {
       ...(isSupervisor ? [{ id: 'crew:ask-queue', text: takeAsksPrompt(), scope: 'session' as const }] : []),
     ]
 
-    const ledger = [{ id: 'crew:ledger', text: ledgerRulePrompt(isSupervisor), scope: 'session' as const }]
+    const ledger = [
+      { id: 'crew:ledger', text: ledgerRulePrompt(isSupervisor), scope: 'session' as const },
+      { id: 'crew:reviews', text: reviewerPrompt(), scope: 'session' as const },
+    ]
 
     return { ...composed, sections: [...composed.sections, ...board, ...progress, ...refresh, ...briefs, ...asks, ...budget, ...ledger] }
   })
@@ -1431,6 +1447,7 @@ export const register: Register = (on, options) => {
                 )}
                 {beat.isParked && <Text color="yellow">parked </Text>}
                 {beat.repo}
+                {beat.model ? <Text dimColor>{` · ${beat.model.replace(/^claude-/, '')}`}</Text> : null}
               </Text>
               {beat.progress && !isOff && (() => {
                 const { task, step, of } = beat.progress
